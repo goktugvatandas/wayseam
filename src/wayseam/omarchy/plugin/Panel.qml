@@ -54,7 +54,14 @@ Panel {
   readonly property string placement: pendingPlacement !== "" ? pendingPlacement : String(snapshot.menuPlacement || "")
   readonly property var hiddenBySlug: Model.hiddenMap(snapshot.apps, pendingVisibility)
   readonly property var presentedBySlug: Model.presentedMap(snapshot.apps)
-  readonly property var filteredApps: Model.filterApps(appList, query)
+  // Hidden apps are grouped under a collapsible row at the bottom so the
+  // list only shows what you actually use; a search always shows matches.
+  property bool hiddenExpanded: false
+  readonly property var appPartition: Model.partitionHidden(Model.filterApps(appList, query), hiddenBySlug)
+  readonly property var visibleApps: appPartition.visible
+  readonly property var hiddenApps: appPartition.hidden
+  readonly property bool hiddenShown: hiddenApps.length > 0 && (hiddenExpanded || query !== "")
+  readonly property var filteredApps: hiddenShown ? visibleApps.concat(hiddenApps) : visibleApps
   readonly property string heroStatus: Model.heroStatus(snapshot, loaded, lastError)
   readonly property string agentVersion: String(snapshot.agentVersion || "")
   readonly property var modes: Model.MODES
@@ -172,7 +179,11 @@ Panel {
   }
 
   function scrollCursorIntoView() {
-    if (focusSection === "apps" && appColumnItem && appIndex >= 0 && appIndex < appColumnItem.children.length) scrollItemIntoView(appColumnItem.children[appIndex])
+    if (focusSection === "apps" && appColumnItem && appIndex >= 0) {
+      // children: visible rows, then the "Hidden apps" toggle row, then hidden rows
+      var child = appIndex < visibleApps.length ? appIndex : appIndex + 1
+      if (child < appColumnItem.children.length) scrollItemIntoView(appColumnItem.children[child])
+    }
   }
 
   function focusSearch() {
@@ -303,6 +314,7 @@ Panel {
 
   onOpenedChanged: if (opened) {
     pendingPod = ""
+    hiddenExpanded = false
     cursorActive = false
     focusSection = "mode"
     pointerGate.reset()
@@ -775,17 +787,60 @@ Panel {
                 spacing: Style.space(4)
 
                 Repeater {
-                  model: root.filteredApps
+                  model: root.visibleApps
                   AppRow {
                     required property var modelData
                     required property int index
+                    readonly property int listIndex: index + 0
                     width: appColumnItem.width
                     app: modelData
                     gate: pointerGate
                     hidden: root.hiddenBySlug[modelData.slug] === true
                     presented: root.presentedBySlug[modelData.slug] === true
-                    rowIndex: index
-                    rowHasCursor: root.cursorActive && root.focusSection === "apps" && root.appIndex === index
+                    rowIndex: listIndex
+                    rowHasCursor: root.cursorActive && root.focusSection === "apps" && root.appIndex === listIndex
+                    cursorColumn: root.appColumn
+                    busy: root.actionBusy
+                    foreground: root.foreground
+                    dim: root.dim
+                    fontFamily: root.fontFamily
+                    onEntered: function(i) { root.setCursor("apps", i) }
+                    onColumnHovered: function(i, c) { root.setCursor("apps", i, c) }
+                    onToggleRequested: function(a) { root.toggleApp(a) }
+                    onLaunchRequested: function(a) { root.launchApp(a) }
+                  }
+                }
+
+                // Collapsible group for hidden apps (search results always show them)
+                Button {
+                  visible: root.hiddenApps.length > 0 && root.query === ""
+                  width: appColumnItem.width
+                  iconText: root.hiddenExpanded ? "󰅀" : "󰅂"
+                  text: "Hidden apps · " + root.hiddenApps.length
+                  fontSize: Style.font.caption
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  bordered: false
+                  tooltipText: root.hiddenExpanded ? "Collapse hidden apps" : "Show hidden apps"
+                  onClicked: {
+                    root.hiddenExpanded = !root.hiddenExpanded
+                    root.ensureCursor()
+                  }
+                }
+
+                Repeater {
+                  model: root.hiddenShown ? root.hiddenApps : []
+                  AppRow {
+                    required property var modelData
+                    required property int index
+                    readonly property int listIndex: index + root.visibleApps.length
+                    width: appColumnItem.width
+                    app: modelData
+                    gate: pointerGate
+                    hidden: root.hiddenBySlug[modelData.slug] === true
+                    presented: root.presentedBySlug[modelData.slug] === true
+                    rowIndex: listIndex
+                    rowHasCursor: root.cursorActive && root.focusSection === "apps" && root.appIndex === listIndex
                     cursorColumn: root.appColumn
                     busy: root.actionBusy
                     foreground: root.foreground

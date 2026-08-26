@@ -282,6 +282,19 @@ function podConfirmText(action) {
   return ""
 }
 
+// Split a (filtered) app list into the rows shown up top and the hidden ones
+// that live under the collapsible "Hidden apps" group at the bottom.
+function partitionHidden(apps, hiddenMap) {
+  var list = Array.isArray(apps) ? apps : []
+  var by = hiddenMap && typeof hiddenMap === "object" ? hiddenMap : {}
+  var visible = [], hidden = []
+  for (var i = 0; i < list.length; i++) {
+    var slug = String(list[i].slug || "")
+    if (by[slug] === true) hidden.push(list[i]); else visible.push(list[i])
+  }
+  return { visible: visible, hidden: hidden }
+}
+
 function runAppCommand(command, slug) {
   return exe(command) + " run " + shellQuote(slug)
 }
