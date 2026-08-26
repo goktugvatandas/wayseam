@@ -1,0 +1,436 @@
+# SPDX-License-Identifier: MIT
+"""Freedesktop .desktop entry file generation and management."""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import struct
+import sys
+from pathlib import Path
+
+from wayseam.apps import AppInfo
+from wayseam.desktop.menu import (
+    FOLDER_KEY,
+    category_for_folder,
+    install_menu_folder,
+    remove_menu_folder,
+)
+from wayseam.paths import applications_dir, icons_dir
+
+log = logging.getLogger(__name__)
+
+DESKTOP_TEMPLATE = """\
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name={full_name}
+Comment={comment}
+Exec={wayseam_exe} run {name} %u
+Icon={icon_name}
+Categories={categories}
+MimeType={mime_types}
+Keywords=windows;wayseam;rdp;{name};
+Terminal=false
+StartupNotify=true
+StartupWMClass={wm_class}
+{folder_line}"""
+
+# Default Comment when discovery couldn't pull a real description from
+# the app's metadata. Better than nothing — keeps the .desktop spec's
+# Comment field non-empty for menu tooltips and file managers.
+_DEFAULT_COMMENT = "Windows application via Wayseam"
+
+# #769: reserved filename stem for the "full Windows desktop" launcher
+# shortcut (equivalent to `wayseam run desktop`). It lives alongside the
+# per-app wayseam-<slug>.desktop entries (same "wayseam-" prefix, same menu
+# folder) so it shows up in the same DE menu group -- but it is NOT an app
+# entry, and slug is never a discovered AppInfo.name. Callers that prune
+# stale wayseam-*.desktop files by slug (cli/app.py, gui/workers.py) must
+# skip this stem explicitly.
+DESKTOP_SHORTCUT_STEM = "wayseam-full-desktop"
+
+_DESKTOP_SHORTCUT_TEMPLATE = """\
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Windows Desktop
+Comment=Full Windows desktop session via Wayseam
+Exec={wayseam_exe} run desktop
+Icon=wayseam
+Categories={categories}
+Keywords=windows;wayseam;rdp;desktop;
+Terminal=false
+StartupNotify=true
+"""
+
+
+def update_desktop_database() -> None:
+    """Rebuild the applications ``mimeinfo.cache`` so ``MimeType=`` lines take
+    effect — without it, an app's declared file associations never surface in
+    the file manager's "Open with" menu (#545). Best-effort: no-op when
+    ``update-desktop-database`` isn't installed; never raises.
+    """
+    import subprocess
+
+    tool = shutil.which("update-desktop-database")
+    if not tool:
+        return
+    try:
+        subprocess.run(
+            [tool, str(applications_dir())],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log.debug("update-desktop-database failed", exc_info=True)
+
+
+def _wayseam_exe() -> str:
+    """Return the absolute path to the wayseam executable.
+
+    Desktop entries must use an absolute path so they work when launched by
+    desktop environments that run apps as systemd transient units with a
+    stripped PATH (e.g. Deepin's dde-application-manager, KDE on Fedora
+    Kinoite).  A bare ``wayseam`` there fails with "Could not find the program
+    'wayseam'" (#779).
+
+    ``shutil.which`` only sees the PATH of whatever process writes the entry,
+    and that is not always the user's interactive PATH: ``install.sh`` runs
+    provisioning through the absolute ``~/.local/bin/wayseam`` symlink, so a
+    shell that has not picked up ``~/.local/bin`` yet resolves nothing.  Fall
+    back through the locations we actually install launchers to before giving
+    up on the bare name (still the last resort, e.g. during tests).
+    """
+    # Inside an AppImage the console script lives on an ephemeral mount
+    # (/tmp/.mount_*) that disappears when the process exits, so writing it
+    # into Exec= yields entries that break on the next boot. $APPIMAGE is the
+    # stable path to the image itself and forwards argv to the entrypoint.
+    appimage = os.environ.get("APPIMAGE", "")
+    if appimage and _is_executable_file(Path(appimage)):
+        return appimage
+
+    found = shutil.which("wayseam")
+    if found:
+        return found
+
+    for candidate in (
+        # Same prefix as the running interpreter — a pip/venv install puts the
+        # console script next to python (covers `python -m wayseam` in a venv).
+        Path(sys.executable).parent / "wayseam",
+        # The symlink install.sh creates; the usual answer on #779 hosts.
+        Path.home() / ".local" / "bin" / "wayseam",
+        # Distro / system-wide installs (RPM, DEB, AUR).
+        Path("/usr/local/bin/wayseam"),
+        Path("/usr/bin/wayseam"),
+    ):
+        if _is_executable_file(candidate):
+            return str(candidate)
+
+    return "wayseam"
+
+
+def _is_executable_file(path: Path) -> bool:
+    """True when ``path`` is an existing file we are allowed to execute."""
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def install_desktop_entry(app: AppInfo, *, no_display: bool = False) -> Path:
+    """Create and install a .desktop file for a Windows app.
+
+    ``no_display=True`` writes ``NoDisplay=true`` so launchers hide the entry
+    while file/URL associations and ``gtk-launch`` keep working (the Omarchy
+    "Windows Apps" submenu placement relies on this).
+    """
+    dest_dir = applications_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    icon_name = _install_icon(app)
+
+    # StartupWMClass must be byte-identical to the /wm-class token FreeRDP is
+    # given (rdp.py), or the WM can't match the RemoteApp window to this entry
+    # -- shared resolver handles UWP (AUMID slug) + wm_class_hint, not just the
+    # exe stem (a UWP exe stem like "microsoft" never matched, so Calculator &
+    # other UWP apps showed up unmatched in the taskbar).
+    from wayseam.desktop_mode.freerdp import resolve_wm_class
+
+    wm_class = resolve_wm_class(
+        app.executable,
+        getattr(app, "wm_class_hint", None) or None,
+        getattr(app, "launch_uri", None) or None,
+    )
+    if getattr(app, "presentation", "wayseam") == "wayseam":
+        from wayseam.present.launch import application_id
+
+        wm_class = application_id(app.name)
+
+    # Prefer the app's real description (from exe metadata / .lnk Comment /
+    # UWP <Description>); fall back to the generic stamp when blank. Strip
+    # newlines and tabs because the .desktop spec keys are line-terminated
+    # and a newline mid-Comment would corrupt later keys.
+    comment = (app.description or "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    comment = comment.strip() or _DEFAULT_COMMENT
+
+    # Same line-termination hazard for the Name= key: full_name comes from guest
+    # discovery JSON (a compromised/hostile guest could embed a newline to inject
+    # arbitrary .desktop keys like Exec= into the launcher spec). Strip control
+    # whitespace exactly as Comment= does, and fall back to the slug if blank.
+    full_name = (app.full_name or app.name).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    full_name = full_name.strip() or app.name
+
+    # Consolidate every Windows app under the "wayseam" menu folder (Wine-style)
+    # instead of scattering them across native categories. #581 Goal 2: the entry
+    # carries the LEAF category for its Start Menu subfolder (just X-wayseam for a
+    # top-level app, or X-wayseam-<slug-chain> for a foldered one), so it lands in
+    # exactly one nested sub-group that the wayseam .menu fragment defines.
+    # App-type discoverability stays via Keywords for menu search.
+    folder = (getattr(app, "start_menu_folder", "") or "").strip()
+    categories = f"{category_for_folder(folder)};"
+    # Record the display folder path so menu.py can rebuild the nested tree +
+    # name each .directory. Sanitised upstream; strip stray newlines defensively.
+    folder_line = ""
+    if folder:
+        safe_folder = folder.replace("\n", " ").replace("\r", " ").strip()
+        folder_line = f"{FOLDER_KEY}={safe_folder}\n"
+
+    # #421/#694: register the app for its URL schemes too, as
+    # x-scheme-handler/<scheme> MIME entries alongside its file MIME types. The
+    # schemes were already policy-filtered in discovery, so no re-escaping here.
+    mime_entries = list(app.mime_types) + [
+        f"x-scheme-handler/{s}" for s in (getattr(app, "url_schemes", None) or [])
+    ]
+
+    content = DESKTOP_TEMPLATE.format(
+        wayseam_exe=_wayseam_exe(),
+        full_name=full_name,
+        name=app.name,
+        comment=comment,
+        icon_name=icon_name,
+        categories=categories,
+        mime_types=";".join(mime_entries) + ";" if mime_entries else "",
+        wm_class=wm_class,
+        folder_line=folder_line,
+    )
+    if no_display:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += "NoDisplay=true\n"
+
+    desktop_path = dest_dir / f"wayseam-{app.name}.desktop"
+    # Explicit UTF-8: .desktop spec requires UTF-8; system locale may be C/POSIX.
+    desktop_path.write_text(content, encoding="utf-8")
+    desktop_path.chmod(0o644)
+
+    # Ensure the folder definition exists so the category resolves to a named
+    # submenu rather than "Lost & Found". Idempotent + best-effort: a failure
+    # here must not block the (already written) entry.
+    try:
+        install_menu_folder()
+    except OSError as e:
+        log.warning("Could not write wayseam menu folder definition: %s", e)
+
+    # Register file + URL-scheme associations so the app shows up in "Open with"
+    # (#545) and as a URL handler (#421/#694). Only when it declares something --
+    # most apps don't, so the cache rebuild stays bounded to the few that need it.
+    if mime_entries:
+        update_desktop_database()
+
+    return desktop_path
+
+
+def install_desktop_shortcut() -> Path:
+    """Create and install the "Windows Desktop" launcher .desktop file (#769).
+
+    Equivalent to ``wayseam run desktop`` -- opens the full Windows
+    desktop (no RemoteApp), so users don't need a terminal for it. Lands
+    under the same wayseam menu folder as the per-app entries, reusing the
+    shared wayseam icon (no per-entry icon to install/clean up).
+    """
+    dest_dir = applications_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    content = _DESKTOP_SHORTCUT_TEMPLATE.format(
+        wayseam_exe=_wayseam_exe(),
+        categories=f"{category_for_folder('')};",
+    )
+
+    desktop_path = dest_dir / f"{DESKTOP_SHORTCUT_STEM}.desktop"
+    desktop_path.write_text(content, encoding="utf-8")
+    desktop_path.chmod(0o644)
+
+    # Same best-effort folder bootstrap as install_desktop_entry: guarantees
+    # the wayseam menu category resolves even if this is the very first
+    # wayseam entry ever installed (e.g. before any app has been discovered).
+    try:
+        install_menu_folder()
+    except OSError as e:
+        log.warning("Could not write wayseam menu folder definition: %s", e)
+
+    return desktop_path
+
+
+def remove_desktop_shortcut() -> None:
+    """Remove the "Windows Desktop" launcher .desktop file (#769).
+
+    No per-entry icon to clean up -- it uses the shared wayseam icon. Mirrors
+    remove_desktop_entry's rebuild-or-tear-down of the menu folder so an
+    emptied folder is still pruned correctly.
+    """
+    apps_dir = applications_dir()
+    (apps_dir / f"{DESKTOP_SHORTCUT_STEM}.desktop").unlink(missing_ok=True)
+
+    try:
+        if apps_dir.exists() and any(apps_dir.glob("wayseam-*.desktop")):
+            install_menu_folder()
+        else:
+            remove_menu_folder()
+    except OSError as e:  # pragma: no cover - defensive, never blocks removal
+        log.warning("Could not update wayseam menu folder definition: %s", e)
+
+
+def remove_desktop_entry(app_name: str) -> None:
+    """Remove the .desktop file, icons, and MIME associations for a Windows app."""
+    # MIME cleanup must precede file deletion; unregister only reads app.name.
+    try:
+        from wayseam.apps import AppInfo
+        from wayseam.desktop.mime import unregister_mime_types
+
+        unregister_mime_types(AppInfo(name=app_name, full_name=app_name, executable=""))
+    except Exception as e:  # pragma: no cover - defensive, never blocks removal
+        log.warning("MIME unregister failed for %s: %s", app_name, e)
+
+    apps_dir = applications_dir()
+    desktop_path = apps_dir / f"wayseam-{app_name}.desktop"
+    desktop_path.unlink(missing_ok=True)
+
+    # Clean both scalable/apps (SVG) and sized dirs (PNG fallbacks from old installs).
+    hicolor = icons_dir()
+    scalable_apps = hicolor / "scalable" / "apps"
+    for ext in (".svg", ".png"):
+        (scalable_apps / f"wayseam-{app_name}{ext}").unlink(missing_ok=True)
+
+    for size_dir in hicolor.glob("*x*/apps"):
+        (size_dir / f"wayseam-{app_name}.svg").unlink(missing_ok=True)
+        (size_dir / f"wayseam-{app_name}.png").unlink(missing_ok=True)
+
+    # Keep the nested menu tree consistent. The GUI launcher's entry is
+    # wayseam.desktop (no "wayseam-" prefix), so it never counts here.
+    #   - last app gone -> tear the whole folder down (no empty "wayseam").
+    #   - apps remain   -> rebuild so an emptied subfolder's .directory is
+    #     pruned and the .menu fragment drops the now-unused node (#581 Goal 2).
+    try:
+        if apps_dir.exists() and any(apps_dir.glob("wayseam-*.desktop")):
+            install_menu_folder()
+        else:
+            remove_menu_folder()
+    except OSError as e:  # pragma: no cover - defensive, never blocks removal
+        log.warning("Could not update wayseam menu folder definition: %s", e)
+
+
+# A fixed-size hicolor directory declares the image's actual pixel size.  UWP
+# resources commonly use non-standard 44px and 88px sizes; filing those under
+# the nearest conventional bucket makes gtk-update-icon-cache reject the whole
+# user icon cache.  Keep the source size exact and register its directory in
+# index.theme during the cache refresh.
+_HICOLOR_SIZES = (16, 22, 24, 32, 48, 64, 128, 256)
+_DEFAULT_PNG_SIZE = 32
+
+
+def _png_dimensions(path: Path) -> tuple[int, int] | None:
+    """Read a PNG's pixel dimensions from its IHDR, or None if unreadable.
+
+    Parsed by hand rather than through an image library: wayseam is stdlib-only
+    on 3.11+, and the first 24 bytes are all this needs.
+    """
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    try:
+        width, height = struct.unpack(">II", header[16:24])
+    except struct.error:
+        return None
+    if not (0 < width <= 1 << 16) or not (0 < height <= 1 << 16):
+        return None
+    return width, height
+
+
+def _hicolor_bucket(path: Path) -> int:
+    """Pick the hicolor size directory a PNG belongs in.
+
+    Uses the larger edge, so a non-square icon is not filed under a size it
+    overflows. Falls back to 32 when the file is not a readable PNG — the same
+    directory everything used to land in, so a malformed file behaves as before
+    rather than disappearing somewhere unexpected.
+    """
+    dims = _png_dimensions(path)
+    if dims is None:
+        return _DEFAULT_PNG_SIZE
+    return max(dims)
+
+
+def _remove_stale_icon_copies(icon_name: str, *, keep: Path) -> None:
+    """Delete this icon from every sized hicolor directory except ``keep``."""
+    for size_dir in icons_dir().glob("*x*/apps"):
+        stale = size_dir / f"{icon_name}.png"
+        if stale == keep:
+            continue
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError as e:  # pragma: no cover - a stale copy is not worth failing over
+            log.debug("could not remove stale icon %s: %s", stale, e)
+
+
+def _install_icon(app: AppInfo) -> str:
+    """Install app icon into the hicolor icon theme. Returns the icon name.
+
+    SVG icons go to scalable/apps/; a PNG goes to the sized directory matching
+    its real dimensions. Other formats fall back to the default wayseam icon.
+    """
+    icon_name = f"wayseam-{app.name}"
+
+    if not app.icon_path:
+        return "wayseam"
+
+    src = Path(app.icon_path)
+    # Refuse symlinks: prevents a stray/malicious link from leaking targets via copy.
+    if src.is_symlink() or not src.exists():
+        return "wayseam"
+
+    suffix = src.suffix.lower()
+    if suffix == ".svg":
+        dest_dir = icons_dir() / "scalable" / "apps"
+        dest = dest_dir / f"{icon_name}.svg"
+    elif suffix == ".png":
+        # Discovered apps often only have PNG from extracted Windows resources,
+        # and those come at whatever size the resource happened to be — UWP
+        # logos are commonly 44x44 or 88x88, not 32x32.
+        bucket = _hicolor_bucket(src)
+        dest_dir = icons_dir() / f"{bucket}x{bucket}" / "apps"
+        dest = dest_dir / f"{icon_name}.png"
+        # An upgrade can move an icon between buckets (everything used to land
+        # in 32x32). Drop the old copies first, or the theme keeps serving a
+        # stale one from whichever directory it searches first.
+        _remove_stale_icon_copies(icon_name, keep=dest)
+    else:
+        log.warning(
+            "Icon %s for app %s is not SVG or PNG (%s); "
+            "hicolor accepts only those. Falling back to default wayseam icon.",
+            src,
+            app.name,
+            src.suffix,
+        )
+        return "wayseam"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest, follow_symlinks=False)
+
+    return icon_name

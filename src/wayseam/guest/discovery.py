@@ -1,0 +1,1658 @@
+# SPDX-License-Identifier: MIT
+"""Dynamic discovery of installed Windows apps on the guest.
+
+Invokes a guest-side PowerShell script (``scripts/windows/discover_apps.ps1``,
+owned by platform-qa) which enumerates UWP/MSIX, Start Menu, and common
+Win32 install locations and emits a JSON array on stdout. Results are
+parsed into ``DiscoveredApp`` records and can be persisted under the
+user data dir so they appear alongside bundled apps in the GUI and CLI.
+
+Public API: ``scan(cfg)`` and ``persist(apps)`` are the explicit
+entry points. Discovery is no longer auto-fired from
+``provisioner.ensure_ready`` — a deliberate simplification per the
+WAYSEAM redesign Step 3 (``feat/redesign``). Callers that want the
+"discover on first install" UX (``install.sh``, the bundled
+``wayseam app refresh`` post-install hook) call
+``run_if_first_boot(cfg)`` explicitly.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import errno
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import struct
+import subprocess
+import threading
+import time
+import zlib
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib  # Python 3.9, 3.10
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from wayseam.apps import discovered_apps_dir as _app_discovered_apps_dir
+from wayseam.config import Config
+from wayseam.paths import guest_scripts_dir
+from wayseam.tomlio import dumps as toml_dumps
+
+log = logging.getLogger(__name__)
+
+
+def _is_guest_shim_path(path: str) -> bool:
+    """Reverse-open shims were dropped in the port; nothing is a shim."""
+    return False
+
+# Default discovery /exec budget. Guest-side Start-Menu + AppX enumeration on
+# a cold or low-spec guest (e.g. 2-core tiny10) legitimately runs over a
+# minute, so the timeout exists only to bound a genuinely wedged guest, not to
+# cap normal completion. Generous (5 min) + the single source of truth for
+# every caller (provision, `wayseam app refresh`, GUI Refresh) — a tighter
+# per-caller override (the CLI used 30 s) is what made `app refresh` time out
+# with "/exec timed out after 29.0s" while a fresh install discovered fine
+# (#619). Users on a pathologically slow guest can still raise it with
+# `wayseam app refresh --timeout`.
+DEFAULT_DISCOVERY_TIMEOUT = 300
+
+# Upper bound so a runaway guest enumerator can't fill the user's disk.
+_MAX_APPS = 500
+_MAX_ICON_BYTES = 1_048_576  # 1 MiB per icon
+_MAX_NAME_LEN = 255
+_MAX_PATH_LEN = 1024
+
+# L1: hard cap on subprocess stdout so a hostile/misbehaving guest can't
+# flood us into OOM. 64 MiB is ~two orders of magnitude above a normal
+# discovery payload (~hundreds of KB) yet still bounded.
+HARD_STDOUT_CAP = 64 * 1024 * 1024  # 64 MiB
+
+# Bounds for PNG sanity validation (M1). Icons above these dimensions are
+# refused even when the bytestream parses cleanly — a 10000x10000 icon is
+# either a DoS vector or a mis-export from the guest.
+_MAX_PNG_WIDTH = 1024
+_MAX_PNG_HEIGHT = 1024
+
+_VALID_SOURCES = frozenset({"uwp", "win32", "steam"})
+
+# Matches AppInfo's _SAFE_NAME_RE contract so a discovered app loads cleanly.
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+# A plausible file extension: a dot + 1-16 alphanumerics (.docx, .7z). Guards
+# the guest-reported extension list before it reaches the .desktop MimeType=.
+_SAFE_EXT_RE = re.compile(r"^\.[a-z0-9]{1,16}$")
+_NAME_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+# v0.2.0: junk filter. Discovery scans Registry App Paths, Start Menu
+# shortcuts, UWP packages, and shim dirs — that union surfaces a lot of
+# non-apps: uninstallers, helpers, redistributables, inbox UWP plumbing
+# whose display name failed to resolve. Drop these before they ever
+# reach the host's persisted layout / GUI. Set
+# ``WAYSEAM_DISCOVERY_INCLUDE_ALL=1`` in the environment to disable
+# filtering for debugging.
+_JUNK_NAME_PATTERNS = (
+    re.compile(r"(?i)\buninstall(er)?\b"),
+    re.compile(r"(?i)\bunins\b"),
+    re.compile(r"(?i)\b(setup|installer|install)\b"),
+    re.compile(r"(?i)\bupdater?\b"),
+    re.compile(r"(?i)\bupgrade\b"),
+    re.compile(r"(?i)\b(readme|release notes)\b"),
+    re.compile(r"(?i)\b(license|eula)\b"),
+    re.compile(r"(?i)\brepair\b"),
+    re.compile(r"(?i)\bcrash"),
+    re.compile(r"(?i)\bhelper\b"),
+    re.compile(r"(?i)redist(ributable)?"),
+    re.compile(r"(?i)bug ?report"),
+    re.compile(r"(?i)report a (bug|problem)"),
+    re.compile(r"(?i)send.+feedback"),
+    re.compile(r"(?i)visual c\+\+"),
+    re.compile(r"(?i)\bdotnet\b"),
+    re.compile(r"(?i)\.net (framework|runtime|core)"),
+)
+
+# Specific Windows binaries that are dependencies / runtimes / inbox
+# accessibility tools — never useful as integrated Linux apps.
+_JUNK_EXE_BASENAMES = frozenset(
+    {
+        "unins000.exe",
+        "unins001.exe",
+        "uninstall.exe",
+        "uninst.exe",
+        "uninst000.exe",
+        "setup.exe",
+        "install.exe",
+        "installer.exe",
+        "vc_redist.x64.exe",
+        "vc_redist.x86.exe",
+        "vcredist_x64.exe",
+        "vcredist_x86.exe",
+        "dotnetfx.exe",
+        "ndp48-x86-x64-allos-enu.exe",
+        "crashpad_handler.exe",
+        "crashreporter.exe",
+        "msedge_proxy.exe",
+        "msedgewebview2.exe",
+        "applicationframehost.exe",
+        "runtimebroker.exe",
+        "narrator.exe",
+        "magnify.exe",
+        "osk.exe",
+        "regedit.exe",
+        "powershell_ise.exe",
+    }
+)
+
+
+def _is_junk_entry(name: str, executable: str, source: str) -> bool:
+    """Return True when a discovered entry should be hidden as junk.
+
+    Filters by display-name patterns (uninstall / setup / redist / …),
+    by executable basename (vcredist, crashpad_handler, …), by
+    reverse-open shim path (wayseam's own Linux-app-into-Windows
+    bridge — must not be re-imported as Windows apps), and — for UWP
+    — by detection of unresolved PackageFamilyName fallbacks where
+    the display name still looks like a dotted identifier
+    (``Microsoft.AAD.BrokerPlugin``) rather than a real human label.
+    """
+    name_stripped = name.strip()
+    if not name_stripped:
+        return True
+
+    # Reverse-open shims (#48 / v0.5.0) are Windows .exe entries
+    # created by wayseam itself to surface Linux host apps in the
+    # Windows "Open with…" menu — they are not Windows apps and must
+    # not be re-imported as such. The check runs before the name /
+    # basename filters so older guest-side scripts that didn't filter
+    # them out still get caught here. The directory comes from
+    # ``reverse_open.sync._GUEST_BIN_DIR`` (single source of truth)
+    # via ``is_guest_shim_path`` — locally-imported to avoid a hot
+    # module-level cycle.
+    is_guest_shim_path = _is_guest_shim_path
+
+    if is_guest_shim_path(executable):
+        return True
+
+    for pattern in _JUNK_NAME_PATTERNS:
+        if pattern.search(name_stripped):
+            return True
+
+    # Windows paths use backslash separators, but discovery runs on Linux
+    # so os.path.basename treats the whole string as one component. Split
+    # on either separator manually.
+    base = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if base in _JUNK_EXE_BASENAMES:
+        return True
+
+    # UWP entries whose DisplayName failed to resolve fall back to
+    # PackageFamilyName (e.g. "Microsoft.AAD.BrokerPlugin"). Real
+    # user-facing UWP apps almost always have spaces or non-dotted
+    # names ("Calculator", "Microsoft To Do"). Allowlist the dotted
+    # names we know are real apps so legitimate Microsoft.* packages
+    # aren't dropped along with the junk plumbing.
+    if source == "uwp" and "." in name_stripped and " " not in name_stripped:
+        if name_stripped.lower() not in _UWP_DOTTED_ALLOWLIST:
+            return True
+
+    return False
+
+
+# Known-good UWP package names whose DisplayName resolves to a dotted
+# identifier rather than a human label (because the manifest's display
+# name uses an ms-resource: indirection that PowerShell can't resolve in
+# a non-interactive session). Comparison is lowercase.
+_UWP_DOTTED_ALLOWLIST = frozenset(
+    n.lower()
+    for n in (
+        "Microsoft.WindowsCalculator",
+        "Microsoft.WindowsTerminal",
+        "Microsoft.Paint",
+        "Microsoft.ScreenSketch",
+        "Microsoft.WindowsCamera",
+        "Microsoft.WindowsAlarms",
+        "Microsoft.WindowsMaps",
+        "Microsoft.WindowsSoundRecorder",
+        "Microsoft.WindowsNotepad",
+        "Microsoft.MicrosoftStickyNotes",
+        "Microsoft.MSPaint",
+        "Microsoft.GetHelp",
+        "Microsoft.YourPhone",
+        "Microsoft.Todos",
+        "windows.immersivecontrolpanel",
+    )
+)
+
+
+class DiscoveryError(RuntimeError):
+    """Raised when guest-side discovery cannot complete.
+
+    Covers: unsupported backend (manual), container runtime
+    missing, script copy/exec failure, timeout, malformed JSON, or
+    the pod not being running.
+
+    The optional ``kind`` keyword attaches a machine-readable tag drawn
+    from the canonical set so CLI/GUI callers can pattern-match without
+    parsing the human-facing message. Canonical kinds:
+
+    - ``pod_not_running`` — transport literally couldn't reach the pod
+      (TCP refused, connect timeout, agent unavailable). Pod is down
+      or starting.
+    - ``session_disconnected`` — the FreeRDP RemoteApp session was
+      terminated by the guest mid-call (LOGOFF_BY_USER, RPC_INITIATED_
+      DISCONNECT, etc.). The pod IS running; what failed is the
+      session wayseam tried to use. Common causes: multi-session
+      mid-activation (TermService cycle kicks the call), the autologon
+      user briefly logging off, or single-session-already-in-use when
+      rdprrap isn't active. Retry usually works.
+    - ``script_missing``
+    - ``script_failed``
+    - ``bad_json``
+    - ``truncated``
+    - ``timeout``
+    - ``unsupported_backend``
+    """
+
+    def __init__(self, msg: str = "", *, kind: str = "") -> None:
+        super().__init__(msg)
+        self.kind = kind
+
+
+@dataclass
+class DiscoveredApp:
+    name: str
+    full_name: str
+    executable: str
+    description: str = ""  # one-line tooltip / .desktop Comment field
+    args: str = ""
+    source: str = "win32"  # uwp | win32 | steam
+    wm_class_hint: str = ""
+    launch_uri: str = ""  # UWP AUMID (shell:AppsFolder\<AUMID>) when source == "uwp"
+    # SHA256 of the guest executable (from discover_apps.ps1's Get-FileHash).
+    # Lets persist_discovered() skip re-extracting an app whose exe is unchanged,
+    # and the periodic icon-refresh re-extract only apps whose exe changed (an
+    # app update). Empty for UWP entries / when the guest couldn't hash it.
+    exe_hash: str = ""
+    icon_bytes: bytes = field(default=b"", repr=False)
+    # Filled by persist_discovered() after the on-disk layout is
+    # materialised. Empty on freshly-parsed instances.
+    slug: str = ""  # sanitized app name slug (same as `name` after persist)
+    icon_path: str = ""  # absolute path to persisted PNG/SVG, or ""
+    # Hybrid filter classification — set by persist_discovered() based on
+    # the curated allowlist / noise denylist + any prior user override.
+    hidden: bool = False
+    essential: bool = False
+    # Real file extensions the guest reports this app handles (from the registry
+    # scan in discover_apps.ps1), e.g. [".docx", ".xlsx"]. Mapped to MIME types
+    # for the .desktop MimeType= when desktop.mime_associations is on (#545).
+    extensions: list[str] = field(default_factory=list)
+    # #581 Goal 2: the app's Start Menu subfolder, relative + sanitized, with
+    # "/" separators (e.g. "Microsoft Office/Tools"). "" = top-level. Mirrored
+    # into a nested wayseam submenu by the desktop-entry / menu generators.
+    start_menu_folder: str = ""
+    # #421/#694: URL schemes the guest reports this app handles (mailto, https,
+    # slack, ...), filtered through the shared url_schemes policy. Emitted as
+    # x-scheme-handler/<scheme> in the .desktop MimeType.
+    url_schemes: list[str] = field(default_factory=list)
+    # #692: a prior app.toml's ``[rdp]`` override table, carried across a rescan.
+    # Discovery never SETS this (it's a user choice) — persist_discovered reads it
+    # off disk before the rewrite and re-emits it, exactly like the ``hidden``
+    # override, so a per-app RDP setting survives re-discovery.
+    rdp_override: dict[str, Any] = field(default_factory=dict)
+    # User-selected presentation transport preserved across discovery rewrites.
+    # Discovery never guesses this from an executable name.
+    presentation: str = "wayseam"
+
+
+# --- Hybrid filter: essentials allowlist + noise denylist -----------------
+#
+# Auto-discovery surfaces 40-50 entries on a stock Windows 11 install — many
+# are system shims (LicenseManagerShellExt, WindowsPackageManagerServer,
+# DesktopPackageMetadata, …) that no user wants in their app menu, and a few
+# OS staples (File Explorer, Settings) don't appear at all because they
+# aren't enumerated as Start Menu .lnk files. The hybrid filter:
+#
+#   1. ESSENTIAL_APPS — guarantees the staples are present (synthesizes a
+#      stub when the scan missed them).
+#   2. NOISE_PATTERNS — auto-flags known system shims as ``hidden=True`` so
+#      the GUI grid filters them by default. Users can unhide via the GUI.
+#   3. User overrides win — if a prior app.toml has explicit ``hidden=true``
+#      / ``hidden=false``, that decision persists across the next scan.
+
+# Curated essentials. Each entry's `name` becomes the slug and must satisfy
+# _SAFE_NAME_RE (lowercase, hyphens). `launch_uri` for UWP triggers the
+# shell:AppsFolder\<AUMID> launcher path; `executable` is the FreeRDP
+# RemoteApp program (explorer.exe is the standard launcher for UWP shells).
+ESSENTIAL_APPS: tuple[dict[str, str], ...] = (
+    {
+        "name": "file-explorer",
+        "full_name": "File Explorer",
+        "executable": "C:\\Windows\\explorer.exe",
+        # explorer.exe launched without arguments tries to take over as
+        # the user shell — RemoteApp shows nothing. shell:MyComputerFolder
+        # opens the "This PC" view as a normal explorer window instead.
+        "args": "shell:MyComputerFolder",
+        "description": "Browse files and folders on the Windows guest",
+        "wm_class_hint": "explorer",
+        "source": "win32",
+    },
+    {
+        "name": "calculator",
+        "full_name": "Calculator",
+        "executable": "explorer.exe",
+        "launch_uri": "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+        "description": "Calculator app from the Windows guest",
+        "wm_class_hint": "calculator",
+        "source": "uwp",
+    },
+    {
+        "name": "settings",
+        "full_name": "Settings",
+        "executable": "explorer.exe",
+        "launch_uri": (
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        ),
+        "description": "Open the Windows guest's Settings panel",
+        "wm_class_hint": "settings",
+        "source": "uwp",
+    },
+)
+
+# Slugs in this set never get auto-hidden, even if a NOISE_PATTERN matches.
+# (No essentials should match a NOISE_PATTERN today, but keep the rule
+# explicit so future denylist edits can't accidentally hide a staple.)
+_ESSENTIAL_SLUGS = frozenset(e["name"] for e in ESSENTIAL_APPS)
+
+# Slug regexes that get auto-hidden. Lowercase + hyphens because that's the
+# slug shape (sanitized name). Patterns are intentionally narrow to avoid
+# catching legitimate apps; a false positive can be reverted with the GUI's
+# Show toggle, but a false negative (visible noise) is what users complain
+# about, so we err toward narrow patterns and let users hide more if they
+# want. Add new entries here when a noisy app surfaces in the wild.
+import re as _re  # noqa: E402 — local alias keeps the patterns readable inline
+
+NOISE_PATTERNS: tuple[_re.Pattern[str], ...] = tuple(
+    _re.compile(p, _re.IGNORECASE)
+    for p in (
+        # System shims and COM/IPC servers — never user-facing.
+        r"^license-?manager-?shell-?ext$",
+        r".*shell-?ext$",
+        r".*-com-server$",
+        r".*-package-manager-server.*",
+        r"^widgets-?platform-?runtime$",
+        r"^desktop-?package-?metadata$",
+        r"^microsoft-?store-?server$",
+        r"^microsoft-?r-?contacts-?import-?tool$",
+        # Internet Explorer is end-of-life and shouldn't be promoted.
+        r"^internet-explorer$",
+        r"^diagnostics-utility-for-internet-explorer$",
+    )
+)
+
+
+def _matches_noise(slug: str) -> bool:
+    """True when `slug` matches any NOISE_PATTERN. Whitelist always wins."""
+    if slug in _ESSENTIAL_SLUGS:
+        return False
+    return any(p.match(slug) for p in NOISE_PATTERNS)
+
+
+def _existing_hidden_override(app_dir: Path) -> bool | None:
+    """Return the user's prior `hidden` override if app.toml exists.
+
+    None means "no prior decision" — let the auto-classifier decide. True
+    or False means the user explicitly set it via the GUI Hide/Show
+    action and we must preserve their choice across rediscovery.
+    """
+    toml_path = app_dir / "app.toml"
+    if not toml_path.exists():
+        return None
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+        return None
+    if "hidden" not in data:
+        return None
+    val = data.get("hidden")
+    return bool(val) if isinstance(val, bool) else None
+
+
+def _existing_rdp_override(app_dir: Path) -> dict[str, Any]:
+    """Return the user's prior ``[rdp]`` override table if app.toml has one (#692).
+
+    Mirrors ``_existing_hidden_override``: read + validate the prior per-app RDP
+    override BEFORE persist_discovered's rmtree wipes it, so the rewritten
+    app.toml can re-emit it and the user's per-app setting survives a rescan. The
+    table is run through the same allowlist ``load_app`` uses, so only the safe
+    ``{scale, extra_flags, multimon}`` subset is carried over. ``{}`` means "no
+    override" (nothing to preserve).
+    """
+    from wayseam.apps import parse_rdp_overrides
+
+    toml_path = app_dir / "app.toml"
+    if not toml_path.exists():
+        return {}
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+        return {}
+    return parse_rdp_overrides(data.get("rdp"))
+
+
+def _existing_presentation(app_dir: Path) -> str:
+    """Return a safe prior per-app presentation choice."""
+    toml_path = app_dir / "app.toml"
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+        return "wayseam"
+    return "rail" if data.get("presentation") == "rail" else "wayseam"
+
+
+def _unchanged_on_disk(app_dir: Path, exe_hash: str) -> bool:
+    """True if ``app_dir`` already holds this exe hash AND still has an icon.
+
+    The checksum gate for persist_discovered: an unchanged exe + a present icon
+    means there is nothing to re-extract, so the entry can be left as-is. A
+    missing icon forces a rewrite even on an unchanged hash so a previously
+    icon-less entry can pick one up.
+    """
+    toml_path = app_dir / "app.toml"
+    if not toml_path.exists():
+        return False
+    if not any((app_dir / f"icon.{ext}").exists() for ext in ("png", "svg")):
+        return False
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+        return False
+    prior = data.get("exe_hash", "")
+    return isinstance(prior, str) and prior.lower() == exe_hash.lower()
+
+
+def _merge_essentials(scanned: list[DiscoveredApp]) -> list[DiscoveredApp]:
+    """Add ESSENTIAL_APPS stubs for any essential not already in `scanned`.
+
+    Match is by slug — if discovery already produced (e.g.) `file-explorer`,
+    the existing entry wins (it has the real icon bytes). Synthesized stubs
+    have no icon; the GUI falls back to a default icon glyph for them.
+    """
+    seen_slugs = {a.name for a in scanned}
+    out = list(scanned)
+    for spec in ESSENTIAL_APPS:
+        slug = spec["name"]
+        if slug in seen_slugs:
+            # Mark the existing entry as essential so it's flagged in
+            # the GUI / can never be hidden by the noise denylist.
+            for app in out:
+                if app.name == slug:
+                    app.essential = True
+                    break
+            continue
+        out.append(
+            DiscoveredApp(
+                name=slug,
+                full_name=spec.get("full_name", slug),
+                executable=spec.get("executable", ""),
+                description=spec.get("description", ""),
+                args=spec.get("args", ""),
+                source=spec.get("source", "win32"),
+                wm_class_hint=spec.get("wm_class_hint", ""),
+                launch_uri=spec.get("launch_uri", ""),
+                essential=True,
+            )
+        )
+    return out
+
+
+def discovered_apps_dir() -> Path:
+    """Path under which persisted discovered apps are stored.
+
+    Thin alias over ``wayseam.apps.discovered_apps_dir`` so callers
+    of ``core.discovery`` don't need a second import. Kept separate
+    from bundled and user-authored entries so a rediscovery run can
+    safely clear/replace only discovered entries.
+    """
+    return _app_discovered_apps_dir()
+
+
+def _ps_script_path() -> Path:
+    """Locate ``scripts/windows/discover_apps.ps1`` via :func:`bundle_dir`."""
+    return guest_scripts_dir() / "discover_apps.ps1"
+
+
+def _runtime_for(backend: str) -> str:
+    if backend == "podman":
+        return "podman"
+    if backend == "docker":
+        return "docker"
+    if backend == "omarchy":
+        return "docker"
+    raise DiscoveryError(
+        f"Discovery requires a container backend (podman/docker); got {backend!r}.",
+        kind="unsupported_backend",
+    )
+
+
+def _wait_for_transport_ready(
+    cfg: Config,
+    *,
+    max_wait_sec: int = 30,
+    progress_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Block until the guest agent answers ``/health`` or ``max_wait_sec`` elapses."""
+    import time as _time
+
+    from wayseam.guest.agent import AgentClient
+
+    client = AgentClient(cfg)
+    deadline = _time.monotonic() + max_wait_sec
+    while _time.monotonic() < deadline:
+        try:
+            client.health()
+            return
+        except Exception:  # noqa: BLE001 — keep polling
+            pass
+        if progress_callback:
+            try:
+                progress_callback("Waiting for the guest agent...")
+            except Exception:  # noqa: BLE001 — progress is decorative
+                pass
+        _time.sleep(1.0)
+
+
+def _looks_suspiciously_empty(apps: list[DiscoveredApp]) -> bool:
+    """Heuristic for "we caught Windows mid-boot" — discovery returned
+    an oddly small set with no UWP entries. Stock Win11 always ships
+    Calculator / Settings / Terminal as UWP packages, so a UWP count
+    of 0 is a reliable signal that AppXSvc was still warming up. Used
+    as a retry gate, not a hard error — if the second pass returns
+    the same shape, that's the real state and we accept it.
+    """
+    total = len(apps)
+    if total == 0:
+        return True
+    # Most stock Win11 installs return 15+ entries even before user
+    # apps are added. Below that is a strong signal of partial result.
+    if total < 5:
+        return True
+    uwp = sum(1 for a in apps if getattr(a, "source", "") == "uwp")
+    return uwp == 0
+
+
+def _classify_channel_error(exc: Exception) -> str:
+    """Map a transport / FreeRDP error message to a ``DiscoveryError`` ``kind``.
+
+    Pre-this-helper the classifier was a one-liner: any error whose
+    message contained ``"no result file"`` or ``"auth"`` was tagged
+    ``pod_not_running``. That over-fired on session-side failures
+    where the pod was very much running -- e.g., FreeRDP RemoteApp
+    succeeded at the connection layer but the guest's RDP session
+    terminated mid-call (``ERRINFO_LOGOFF_BY_USER`` /
+    ``ERRINFO_RPC_INITIATED_DISCONNECT``, both of which produce a
+    "no result file written" outer message because the script never
+    finished writing). The GUI then surfaced a "Pod Not Running"
+    dialog on a perfectly running pod (kernalix7 hit this 2026-05-03
+    after a fresh install).
+
+    The new logic separates four states:
+
+    1. ``pod_not_running`` — connection refused / connect transport
+       failed / agent unavailable. Pod is genuinely down or still
+       booting.
+    2. ``session_disconnected`` — FreeRDP RemoteApp connected but
+       the session terminated (LOGOFF_BY_USER, RPC_INITIATED_DISCONNECT,
+       common during multi-session mid-activation). Retry usually
+       works.
+    3. ``timeout`` — the transport or guest command exceeded its deadline.
+    4. ``script_failed`` — anything else (script crash, malformed
+       output, etc.).
+    """
+    msg = str(exc).lower()
+    pod_down_signals = (
+        "connection refused",
+        "errconnect_connect_transport_failed",
+        "errconnect_activation_timeout",
+        "transport_read_layer",
+        "connection reset",
+        "transport failed",
+        "unavailable",  # agent-transport flag for /health miss
+    )
+    if any(s in msg for s in pod_down_signals):
+        return "pod_not_running"
+    session_disconnect_signals = (
+        "errinfo_logoff_by_user",
+        "errinfo_rpc_initiated_disconnect",
+        "errinfo_remote_by_user",
+        "errinfo_logoff_by_admin",
+        "0x0001000c",  # LOGOFF_BY_USER hex
+        "0x00010001",  # RPC_INITIATED_DISCONNECT hex
+    )
+    if any(s in msg for s in session_disconnect_signals):
+        return "session_disconnected"
+    # Auth failure is its own thing -- pod's running but credentials don't
+    # match. Caller can route this to the sync-password rescue path.
+    if "auth" in msg or "logon_failure" in msg or "0xc000006d" in msg:
+        return "pod_not_running"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    return "script_failed"
+
+
+def discover_apps(
+    cfg: Config,
+    timeout: int = DEFAULT_DISCOVERY_TIMEOUT,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+) -> list[DiscoveredApp]:
+    """Run guest-side discovery and return the parsed apps.
+
+    Copies ``discover_apps.ps1`` into the running Windows container and
+    executes it via ``{runtime} exec``. The script is expected to print
+    a JSON array of objects shaped as::
+
+        [{"name","path","args","source","wm_class_hint",
+          "launch_uri","icon_b64"}, ...]
+
+    and may include ``"_truncated": true`` as its last element to
+    indicate the guest clipped its own output.
+
+    Default ``timeout`` is :data:`DEFAULT_DISCOVERY_TIMEOUT` (generous, to
+    absorb the script's first-boot readiness gate — up to 60 s waiting for
+    AppXSvc + Start Menu .lnks — plus AppX enumeration on a low-spec guest).
+
+    First-boot races (Sysprep just finished, AppX still deploying,
+    Start Menu indexer mid-propagation) used to produce empty / partial
+    results stochastically — kernalix7 reported (2026-05-02) menu
+    populating one install and missing UWP entries the next on
+    identical configs. Three layers now collapse the variance:
+
+      1. Guest-side readiness gate (``discover_apps.ps1``) waits for
+         AppXSvc Running + ProgramData Start Menu .lnk count > 0,
+         requiring 3 consecutive stable 1 s samples before enumerating.
+      2. Host-side transport readiness (this function, just below)
+         waits for agent /health or RDP port to answer before invoking
+         the script — covers the migrate-apply-chain race where
+         TermService just cycled and the agent is mid-respawn.
+      3. Host-side retry-on-empty (this function, after first run)
+         retries once if the result is suspiciously empty (< 5 apps
+         or 0 UWP — both impossible on a stock Win11 install).
+
+    Raises:
+        DiscoveryError: backend unsupported, runtime missing, pod not
+            running, script copy/exec failure, timeout, or malformed
+            output.
+    """
+    runtime = _runtime_for(cfg.pod.backend)
+
+    if shutil.which(runtime) is None:
+        raise DiscoveryError(
+            f"{runtime!r} not found on PATH; install {cfg.pod.backend} first.",
+            kind="pod_not_running",
+        )
+
+    script = _ps_script_path()
+    if not script.exists():
+        raise DiscoveryError(f"Discovery script not found: {script}", kind="script_missing")
+
+    # v0.1.9.5: was on the broken `podman exec -i ... powershell -Command -`
+    # path (kernalix7's machine showed rc=127 "powershell.exe not found in
+    # $PATH" because podman exec only reaches the dockur Linux container,
+    # not the Windows VM inside). Migrated to ``windows_exec.run_in_windows``
+    # alongside the rest of the host->Windows command paths.
+    try:
+        script_body = script.read_text(encoding="utf-8")
+    except OSError as e:
+        raise DiscoveryError(
+            f"Cannot read discovery script {script}: {e}", kind="script_missing"
+        ) from e
+
+    # #581: opt into the legacy full 5-source scan. The script defaults to
+    # Start-Menu-only; flip its `$WayseamFullScan = $false` line to `= $true`
+    # when the user enabled desktop.full_app_scan. We patch the body (not a
+    # prepend / CLI arg) because the script is exec'd as a -Command body where
+    # `param` must remain the first statement and switch args can't be passed.
+    if getattr(getattr(cfg, "desktop", None), "full_app_scan", False):
+        patched = script_body.replace("$WayseamFullScan = $false", "$WayseamFullScan = $true", 1)
+        if patched == script_body:
+            log.warning(
+                "full_app_scan enabled but discovery script sentinel not found; "
+                "falling back to default Start-Menu-only scan"
+            )
+        script_body = patched
+
+    # Wait for at least one transport to answer before invoking the
+    # script. Covers the install.sh race where migrate's apply chain
+    # just cycled TermService (multi-session activation) and the
+    # agent is mid-respawn — without this, discovery fires into a
+    # freshly-killed agent and bails with channel-failure cascade.
+    _wait_for_transport_ready(cfg, max_wait_sec=30, progress_callback=progress_callback)
+
+    # Prefer the HTTP agent transport when it answers /health — the
+    # discovery script regularly takes 15-25s and the legacy FreeRDP
+    # RemoteApp channel hits a hard 30s wall (kernalix7 saw the timeout
+    # on 2026-05-01 with a stock Win11 install). The agent's /exec has a
+    # default 60s timeout and exposes the script's stdout directly via
+    # JSON so we don't have to round-trip a result file. Falls back to
+    # FreeRDP automatically if /health doesn't answer.
+    from wayseam.guest.agent import AgentClient, AgentError
+
+    def _run_once() -> list[DiscoveredApp]:
+        if progress_callback:
+            try:
+                progress_callback("Connecting to guest agent...")
+            except Exception:  # noqa: BLE001 — progress is decorative
+                pass
+        try:
+            result = AgentClient(cfg).exec(script_body, timeout=timeout)
+        except AgentError as e:
+            raise DiscoveryError(
+                f"Discovery channel failure: {e}", kind=_classify_channel_error(e)
+            ) from e
+        if result.rc != 0:
+            raise DiscoveryError(
+                f"Discovery script failed (rc={result.rc}): {result.stderr.strip()}",
+                kind="timeout" if result.rc == 124 else "script_failed",
+            )
+        return _parse_discovery_output(result.stdout)
+
+    def _uwp_count(found) -> int:
+        return sum(1 for a in found if getattr(a, "source", "") == "uwp")
+
+    apps = _run_once()
+    if _looks_suspiciously_empty(apps):
+        # Caught Windows mid-boot. Wait briefly and rerun — by now AppX
+        # deployment / Start Menu indexer should have settled. We only
+        # retry once: if the second pass also looks empty, it's the
+        # real state (e.g., a stripped-down image) and we accept it
+        # rather than spin forever.
+        log.info(
+            "discovery looks suspiciously empty (%d total, %d uwp); retrying once",
+            len(apps),
+            _uwp_count(apps),
+        )
+        if progress_callback:
+            try:
+                progress_callback("Initial scan looked partial; retrying...")
+            except Exception:  # noqa: BLE001
+                pass
+        import time as _time
+
+        _time.sleep(8)
+        retry_apps = _run_once()
+        # Prefer the retry when it recovered apps — never regress. The
+        # suspicion is often a missing-UWP gap that leaves the total
+        # unchanged, so accept an equal-size retry that filled in more
+        # UWP entries, not just a strictly larger total.
+        if len(retry_apps) > len(apps) or _uwp_count(retry_apps) > _uwp_count(apps):
+            return retry_apps
+    return apps
+
+
+def _run_bounded(
+    cmd: list[str],
+    *,
+    timeout: int,
+    runtime: str,
+    stdin_bytes: bytes | None = None,
+) -> tuple[bytes, bytes, int]:
+    """Run ``cmd`` and return ``(stdout, stderr, returncode)`` with a hard cap.
+
+    Spawns the process via ``Popen`` and drains stdout / stderr via
+    ``os.read`` with an accumulated byte cap of ``HARD_STDOUT_CAP``
+    (L1 audit). If the cap is exceeded the process is killed and a
+    ``DiscoveryError(kind="truncated")`` is raised. If the process
+    does not finish within ``timeout`` seconds it is killed and a
+    ``DiscoveryError(kind="timeout")`` is raised.
+
+    When ``stdin_bytes`` is provided the bytes are written to the
+    child's stdin and the pipe is closed before draining begins
+    (Bug A fix: ``powershell -Command -`` reads the script body from
+    stdin so the host doesn't need to ``podman cp`` into the Windows
+    VM's virtual disk).
+
+    Returns raw bytes so the caller decodes exactly once with an
+    error-replace codec — this avoids UTF-8 decode exceptions on
+    malformed guest output.
+    """
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": False,
+    }
+    if stdin_bytes is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
+    except FileNotFoundError as e:
+        raise DiscoveryError(
+            f"{runtime!r} binary vanished mid-run: {e}", kind="pod_not_running"
+        ) from e
+
+    if stdin_bytes is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_bytes)
+        except (BrokenPipeError, OSError) as err:
+            log.debug("discovery: stdin write failed (%s); continuing", err)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_bytes = 0
+    stderr_bytes = 0
+
+    # Readers drain stdout/stderr in background threads so a full pipe
+    # buffer can't deadlock the child. Each reader enforces the cap
+    # independently and sets an event if tripped.
+    cap_tripped = threading.Event()
+
+    def _drain(fd: int, sink: list[bytes], counter_name: str) -> None:
+        nonlocal stdout_bytes, stderr_bytes
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError as err:
+                    if err.errno == errno.EBADF:
+                        return
+                    raise
+                if not chunk:
+                    return
+                sink.append(chunk)
+                if counter_name == "stdout":
+                    stdout_bytes += len(chunk)
+                    if stdout_bytes > HARD_STDOUT_CAP:
+                        cap_tripped.set()
+                        return
+                else:
+                    stderr_bytes += len(chunk)
+                    # stderr is also capped (symmetry + cheap guard).
+                    if stderr_bytes > HARD_STDOUT_CAP:
+                        cap_tripped.set()
+                        return
+        except Exception:
+            # Reader threads must never propagate — surface via cap_tripped
+            # + returncode on the main path.
+            log.debug("discovery: reader thread crashed", exc_info=True)
+
+    assert proc.stdout is not None and proc.stderr is not None
+    t_out = threading.Thread(
+        target=_drain, args=(proc.stdout.fileno(), stdout_chunks, "stdout"), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_drain, args=(proc.stderr.fileno(), stderr_chunks, "stderr"), daemon=True
+    )
+    t_out.start()
+    t_err.start()
+
+    deadline = time.monotonic() + max(1, int(timeout))
+    killed_for_cap = False
+    killed_for_timeout = False
+    while True:
+        if cap_tripped.is_set():
+            killed_for_cap = True
+            proc.kill()
+            break
+        if proc.poll() is not None:
+            break
+        if time.monotonic() >= deadline:
+            killed_for_timeout = True
+            proc.kill()
+            break
+        time.sleep(0.05)
+
+    # Wait for process + drain threads to finish so we don't leak FDs.
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+
+    if killed_for_cap:
+        raise DiscoveryError(
+            f"Discovery stdout exceeded {HARD_STDOUT_CAP} bytes; aborted.",
+            kind="truncated",
+        )
+    if killed_for_timeout:
+        raise DiscoveryError(f"Discovery timed out after {timeout}s on guest.", kind="timeout")
+
+    return b"".join(stdout_chunks), b"".join(stderr_chunks), proc.returncode
+
+
+def _parse_discovery_output(stdout: str) -> list[DiscoveredApp]:
+    """Parse the JSON array emitted by ``discover_apps.ps1``."""
+    text = stdout.strip()
+    if not text:
+        return []
+
+    # PowerShell may prepend a UTF-8 BOM to Out-String/ConvertTo-Json output.
+    if text.startswith("﻿"):
+        text = text[1:]
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        snippet = text[:200].replace("\n", " ")
+        raise DiscoveryError(
+            f"Malformed discovery JSON: {e}; head={snippet!r}", kind="bad_json"
+        ) from e
+
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise DiscoveryError(
+            f"Discovery JSON must be an array, got {type(raw).__name__}.", kind="bad_json"
+        )
+
+    apps: list[DiscoveredApp] = []
+    truncated = False
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("_truncated") is True:
+            truncated = True
+            continue
+        parsed = _entry_to_discovered(entry)
+        if parsed is not None:
+            apps.append(parsed)
+        if len(apps) >= _MAX_APPS:
+            truncated = True
+            break
+
+    if truncated:
+        log.warning(
+            "Discovery output was truncated (>%d apps or guest-side clip); showing the first %d.",
+            _MAX_APPS,
+            len(apps),
+        )
+    return apps
+
+
+# #581 Goal 2: bounds for the Start Menu folder path mirrored into the menu.
+_MAX_FOLDER_DEPTH = 4
+_MAX_FOLDER_COMPONENT_LEN = 48
+
+
+def _sanitize_start_menu_folder(raw: object) -> str:
+    """Normalise a guest-reported Start Menu subfolder into a safe relative path.
+
+    The value becomes both an XDG menu node and a ``.directory`` filename slug,
+    so a hostile/odd guest must not be able to smuggle path traversal, absolute
+    paths, control characters, or unbounded depth. Returns a ``/``-joined path
+    of cleaned components (display text preserved — spaces/case kept), or ``""``
+    for top-level / unusable input.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    components: list[str] = []
+    for part in raw.replace("\\", "/").split("/"):
+        # Strip control chars (incl. newlines — .directory is line-terminated)
+        # and surrounding whitespace/dots.
+        cleaned = "".join(ch for ch in part if ch.isprintable()).strip().strip(".")
+        if not cleaned or cleaned in (".", ".."):
+            continue
+        if ":" in cleaned:  # drive letters / NTFS ADS — never a real subfolder
+            continue
+        components.append(cleaned[:_MAX_FOLDER_COMPONENT_LEN])
+        if len(components) >= _MAX_FOLDER_DEPTH:
+            break
+    return "/".join(components)
+
+
+def _entry_to_discovered(entry: dict[str, Any]) -> DiscoveredApp | None:
+    """Validate and convert one JSON entry into a ``DiscoveredApp``."""
+    raw_name = entry.get("name")
+    path = entry.get("path")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return None
+    if not isinstance(path, str) or not path.strip():
+        return None
+    if len(raw_name) > _MAX_NAME_LEN or len(path) > _MAX_PATH_LEN:
+        return None
+
+    source = entry.get("source", "win32")
+    if source not in _VALID_SOURCES:
+        source = "win32"
+
+    args = entry.get("args", "")
+    if not isinstance(args, str) or len(args) > _MAX_PATH_LEN:
+        args = ""
+
+    description = entry.get("description", "")
+    if not isinstance(description, str):
+        description = ""
+    # Bound the description so a hostile guest can't fill the .desktop
+    # Comment field with megabytes of garbage.
+    description = description.strip()[:512]
+
+    wm_class_hint = entry.get("wm_class_hint", "")
+    if not isinstance(wm_class_hint, str) or len(wm_class_hint) > _MAX_NAME_LEN:
+        wm_class_hint = ""
+
+    launch_uri = entry.get("launch_uri", "")
+    if not isinstance(launch_uri, str) or len(launch_uri) > _MAX_PATH_LEN:
+        launch_uri = ""
+
+    # SHA256 hex (64 chars) of the guest exe; reject anything else so a hostile
+    # guest can't stuff junk into the persisted profile / change-detection key.
+    exe_hash = entry.get("exe_hash", "")
+    if not isinstance(exe_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", exe_hash):
+        exe_hash = ""
+    else:
+        exe_hash = exe_hash.lower()
+
+    # UWP entries must have a launch_uri (AUMID); otherwise they are unlaunchable.
+    if source == "uwp" and not launch_uri:
+        return None
+
+    # v0.2.0: drop common Windows junk (uninstallers, helpers, redistributables,
+    # unresolved UWP package fallbacks). Bypass with WAYSEAM_DISCOVERY_INCLUDE_ALL=1.
+    if not os.environ.get("WAYSEAM_DISCOVERY_INCLUDE_ALL") and _is_junk_entry(
+        raw_name, path, source
+    ):
+        return None
+
+    icon_b64 = entry.get("icon_b64", "")
+    icon_bytes = b""
+    if isinstance(icon_b64, str) and icon_b64:
+        try:
+            icon_bytes = base64.b64decode(icon_b64, validate=True)
+        except (binascii.Error, ValueError):
+            icon_bytes = b""
+        if len(icon_bytes) > _MAX_ICON_BYTES:
+            icon_bytes = b""
+
+    slug = _slugify_name(raw_name)
+    if not slug:
+        return None
+
+    # Real file extensions the guest reports this app handles (#545). Validate +
+    # normalise to ".ext" lowercase; drop junk so a hostile guest can't smuggle
+    # arbitrary strings into the .desktop MimeType=.
+    extensions: list[str] = []
+    raw_exts = entry.get("extensions", [])
+    if isinstance(raw_exts, list):
+        for e in raw_exts[:64]:
+            if not isinstance(e, str) or not e.strip():
+                continue
+            ext = e.strip().lower()
+            if not ext.startswith("."):
+                ext = "." + ext
+            if _SAFE_EXT_RE.match(ext) and ext not in extensions:
+                extensions.append(ext)
+
+    start_menu_folder = _sanitize_start_menu_folder(entry.get("start_menu_folder", ""))
+
+    # #421/#694: URL schemes the app handles. Filter through the shared policy
+    # (syntactic regex + denylist) so a hostile guest can't register wayseam as
+    # a handler for a dangerous scheme (file:, javascript:, ...); dedupe + cap.
+    from wayseam.desktop.url_schemes import is_safe_scheme
+
+    url_schemes: list[str] = []
+    raw_schemes = entry.get("url_schemes", [])
+    if isinstance(raw_schemes, list):
+        for s in raw_schemes[:64]:
+            if not isinstance(s, str):
+                continue
+            scheme = s.strip().rstrip(":").lower()
+            if is_safe_scheme(scheme) and scheme not in url_schemes:
+                url_schemes.append(scheme)
+
+    return DiscoveredApp(
+        name=slug,
+        full_name=raw_name.strip(),
+        executable=path.strip(),
+        description=description,
+        args=args,
+        source=source,
+        wm_class_hint=wm_class_hint,
+        launch_uri=launch_uri,
+        exe_hash=exe_hash,
+        icon_bytes=icon_bytes,
+        extensions=extensions,
+        start_menu_folder=start_menu_folder,
+        url_schemes=url_schemes,
+    )
+
+
+def _slugify_name(raw: str) -> str:
+    """Convert a display name into a safe AppInfo ``name`` slug.
+
+    Lowercases, replaces runs of unsafe chars with ``-``, trims leading
+    and trailing dashes and underscores, and bounds the length.
+
+    A name with NO ASCII-safe characters at all (e.g. a purely Chinese /
+    Japanese / Korean app name) would otherwise sanitize to an empty slug and
+    the app would be silently dropped from discovery (#553). The slug is only
+    an internal key (the ``.desktop`` filename, ``/wm-class``, and
+    ``wayseam app run <slug>``); the human-visible name is ``full_name``, which
+    keeps the original characters. So when sanitization is empty we fall back to
+    a STABLE ASCII slug derived from the raw name (same name -> same slug, so a
+    re-scan doesn't duplicate it) instead of discarding the app.
+    """
+    raw = raw.strip()
+    slug = _NAME_SANITIZE_RE.sub("-", raw.lower()).strip("-_")
+    if not slug:
+        if not raw:
+            return ""
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+        return f"app-{digest}"
+    if len(slug) > 64:
+        slug = slug[:64].rstrip("-_")
+    if not _SAFE_NAME_RE.match(slug):
+        return ""
+    return slug
+
+
+def persist_discovered(
+    apps: list[DiscoveredApp],
+    target_dir: Path | None = None,
+    replace: bool = True,
+    *,
+    add_essentials: bool = True,
+) -> list[Path]:
+    """Write discovered apps as ``<dir>/<name>/{app.toml, icon.*}`` entries.
+
+    Args:
+        apps: Output of ``discover_apps``.
+        target_dir: Destination root. Defaults to ``discovered_apps_dir()``.
+        replace: If True, removes any existing per-app subdir before
+            writing. Bundled / user-authored entries are untouched —
+            only the discovered tree is affected.
+
+    Returns:
+        List of ``app.toml`` paths written (skipped entries are
+        omitted).
+    """
+    root = target_dir if target_dir is not None else discovered_apps_dir()
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Self-heal: earlier wayseam builds (before this fix) could re-import
+    # reverse-open shims as Windows apps on discovery, leaving polluted
+    # entries under discovered/. Sweep them now so this run cleans up
+    # after the bug — users don't need a manual `rm -rf` step.
+    _purge_reverse_open_entries(root)
+
+    # #581: whether the SCAN itself returned anything (captured before
+    # essentials are merged in). Gates the orphan-prune below so a failed /
+    # empty discovery — which would otherwise leave only synthesized essentials
+    # — can never wipe the existing menu.
+    had_real_apps = bool(apps)
+
+    # Hybrid filter step — guarantee essentials are present (synthesizing
+    # stubs when the scan missed them) before we touch disk. Tests can
+    # opt out via ``add_essentials=False`` to keep their fixtures
+    # isolated from the curated list.
+    if add_essentials:
+        apps = _merge_essentials(apps)
+
+    written: list[Path] = []
+    from wayseam.apps import suppressed_app_slugs
+
+    suppressed = suppressed_app_slugs()  # user-deleted discovered apps (#514)
+    mime_enabled = _mime_associations_enabled()  # file associations on? (#545)
+
+    seen: set[str] = set()
+    for app in apps:
+        if app.name in seen:
+            continue
+        if not _SAFE_NAME_RE.match(app.name):
+            continue
+        if app.name in suppressed:
+            continue  # deleted from discovery — don't resurrect it
+        seen.add(app.name)
+
+        app_dir = root / app.name
+
+        # Checksum gate: if the guest reported an exe hash and it matches the
+        # one already on disk, AND that entry still has its icon, the app is
+        # unchanged -- leave it untouched. This is what makes a periodic refresh
+        # cheap (re-extract only apps whose exe changed = an app update) and
+        # keeps an unchanged app's icon stable. Skipped for UWP / hashless
+        # entries (exe_hash ""), which always re-write as before.
+        if replace and app.exe_hash and _unchanged_on_disk(app_dir, app.exe_hash):
+            # Even when the exe is unchanged (so we keep the icon + skip the
+            # rewrite), backfill MIME associations into a TOML that predates the
+            # auto-map so existing Office/etc. apps gain file handlers on a plain
+            # refresh — without disturbing the icon (#545).
+            _backfill_mime_types(app_dir / "app.toml", app, mime_enabled)
+            written.append(app_dir / "app.toml")
+            continue
+
+        # Read the user's prior hidden override BEFORE the rmtree below
+        # nukes it; the override (None / True / False) decides what gets
+        # stamped into the new app.toml so the user's choice is sticky
+        # across rediscovery sweeps.
+        prior_override = _existing_hidden_override(app_dir)
+        # #692: likewise carry the prior per-app [rdp] override table across the
+        # rewrite so a user's per-app RDP setting survives re-discovery.
+        app.rdp_override = _existing_rdp_override(app_dir)
+        app.presentation = _existing_presentation(app_dir)
+
+        if replace and app_dir.exists():
+            _safe_rmtree(app_dir, root)
+        app_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stamp the contract fields cli/gui callers rely on (I2). slug
+        # mirrors `name` post-sanitisation; icon_path is filled below
+        # only when a valid image is written.
+        app.slug = app.name
+        app.icon_path = ""
+
+        # Resolve hidden state in priority order: explicit user override
+        # (None means no override) > essentials (never auto-hidden) >
+        # noise denylist (auto-hide). Result lands in app.toml so
+        # AppInfo.hidden reflects it on next load.
+        if prior_override is not None:
+            app.hidden = prior_override
+        elif app.essential:
+            app.hidden = False
+        else:
+            app.hidden = _matches_noise(app.name)
+
+        toml_path = app_dir / "app.toml"
+        try:
+            toml_path.write_text(_render_app_toml(app, mime_enabled), encoding="utf-8")
+        except OSError as e:
+            log.warning("Could not write %s: %s", toml_path, e)
+            continue
+
+        if app.icon_bytes:
+            icon_ext = _sniff_icon_ext(app.icon_bytes)
+            icon_ok = True
+            if icon_ext == "png" and not _validate_png_bytes(app.icon_bytes):
+                # M1: malformed / oversized / CRC-broken PNG from a
+                # compromised guest must not abort the run. Skip this
+                # app's icon but keep the entry.
+                log.warning(
+                    "Rejecting malformed PNG icon for %s; writing entry without icon.", app.name
+                )
+                icon_ok = False
+            if icon_ext and icon_ok:
+                icon_target = app_dir / f"icon.{icon_ext}"
+                try:
+                    icon_target.write_bytes(app.icon_bytes)
+                    app.icon_path = str(icon_target.resolve())
+                except OSError as e:
+                    log.warning("Could not write icon for %s: %s", app.name, e)
+
+        written.append(toml_path)
+
+    # #581: prune ORPHANED discovered entries — per-app dirs from a previous
+    # (larger) scan that this scan no longer produced. This is what makes a
+    # refresh MIGRATE the menu: when the Start-Menu-only default shrinks the set
+    # (or an app is uninstalled in the guest), the stale ``discovered/<slug>``
+    # dir is removed here, so list_available_apps() drops it and the downstream
+    # ``app refresh`` .desktop cleanup removes its launcher. Guards:
+    #   * only on ``replace`` (the full-replacement contract), and only when the
+    #     scan returned real apps (``had_real_apps``) — a failed/empty discovery
+    #     must never wipe the menu down to essentials.
+    #   * scoped to ``root`` (the discovered tree); user_apps_dir() is a separate
+    #     directory and is never enumerated here, so manually-added apps are
+    #     untouched.
+    # Suppressed slugs (#514) are already absent from ``seen`` and from disk, so
+    # they need no special handling.
+    if replace and had_real_apps:
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if child.name in seen or not child.is_dir():
+                continue
+            if not _SAFE_NAME_RE.match(child.name):
+                continue
+            _safe_rmtree(child, root)
+
+    return written
+
+
+def _mime_associations_enabled() -> bool:
+    """Whether to write file associations into discovered TOMLs (#545, default on)."""
+    try:
+        from wayseam.config import Config
+
+        return bool(Config.load().desktop.mime_associations)
+    except Exception:  # noqa: BLE001 — never let a config read break discovery
+        return True
+
+
+def _backfill_mime_types(toml_path: Path, app: DiscoveredApp, mime_enabled: bool = True) -> None:
+    """Add the guest's real associations to an unchanged app's TOML (#545, #694).
+
+    Apps that survive the checksum gate (unchanged exe) are never rewritten, so
+    one persisted before a feature shipped would keep its empty ``mime_types`` /
+    ``url_schemes``. Patch each from the guest-reported data, ONLY when the
+    persisted list is empty (never clobber). MIME is gated on the feature flag;
+    URL schemes mirror ``_render_app_toml`` (always). Best-effort; preserves the
+    icon and every other field.
+    """
+    from wayseam.desktop.mime_map import mimes_for_extensions
+
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+        return
+
+    changed = False
+    if mime_enabled and not data.get("mime_types"):
+        mimes = mimes_for_extensions(app.extensions)
+        if mimes:
+            data["mime_types"] = mimes
+            changed = True
+    if app.url_schemes and not data.get("url_schemes"):
+        data["url_schemes"] = app.url_schemes
+        changed = True
+    if not changed:
+        return
+    try:
+        from wayseam.tomlio import dumps as toml_dumps
+
+        toml_path.write_text(toml_dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _render_app_toml(app: DiscoveredApp, mime_enabled: bool = True) -> str:
+    """Render a ``DiscoveredApp`` into the AppInfo-loadable TOML shape."""
+    from wayseam.desktop.mime_map import mimes_for_extensions
+
+    # Auto-register the file associations the guest actually reported (#545),
+    # mapped to standard MIME types. Off → empty. A user edit under apps/<slug>
+    # still wins (list_available_apps).
+    data: dict[str, Any] = {
+        "name": app.name,
+        "full_name": app.full_name,
+        "executable": app.executable,
+        "categories": [],
+        "mime_types": mimes_for_extensions(app.extensions) if mime_enabled else [],
+    }
+    if app.args:
+        data["args"] = app.args
+    if app.description:
+        data["description"] = app.description
+    if app.source:
+        data["source"] = app.source
+    if app.wm_class_hint:
+        data["wm_class_hint"] = app.wm_class_hint
+    if app.launch_uri:
+        data["launch_uri"] = app.launch_uri
+    if app.exe_hash:
+        data["exe_hash"] = app.exe_hash
+    if app.start_menu_folder:
+        data["start_menu_folder"] = app.start_menu_folder
+    if app.url_schemes:
+        data["url_schemes"] = app.url_schemes
+    # Always emit hidden / essential when set so AppInfo.load_app picks
+    # them up. Keep the keys absent on the default-False side to keep
+    # toml diffs minimal for the common case (visible, non-essential).
+    if app.hidden:
+        data["hidden"] = True
+    if app.essential:
+        data["essential"] = True
+    data["presentation"] = "rail" if app.presentation == "rail" else "wayseam"
+    # #692: re-emit a preserved per-app [rdp] override table. Kept LAST so the
+    # nested table follows every top-level scalar (the toml_writer also enforces
+    # scalars-before-tables, but keeping order here makes the intent explicit).
+    if app.rdp_override:
+        data["rdp"] = dict(app.rdp_override)
+    return toml_dumps(data)
+
+
+def _sniff_icon_ext(data: bytes) -> str:
+    """Return ``'png'``, ``'svg'``, or ``''`` based on the icon header."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    head = data[:256].lstrip().lower()
+    if head.startswith(b"<?xml") or head.startswith(b"<svg"):
+        return "svg"
+    return ""
+
+
+def _validate_png_bytes(data: bytes) -> bool:
+    """Return True only if ``data`` is a structurally valid PNG (M1).
+
+    The 8-byte magic check in ``_sniff_icon_ext`` is sufficient to
+    *classify* bytes as PNG but not to trust them as a PNG — a guest
+    can trivially prepend the magic to arbitrary garbage. This helper
+    runs a second-pass validation before the bytes reach disk /
+    hicolor cache:
+
+    1. If PySide6 is available, use ``QImage.loadFromData`` and reject
+       anything that lands on ``QImage.isNull()``.
+    2. Otherwise fall back to a stdlib chunk walker that verifies the
+       PNG magic, requires ``IHDR`` as the first chunk with sane
+       dimensions (``0 < w,h <= _MAX_PNG_WIDTH/_MAX_PNG_HEIGHT``),
+       validates every chunk CRC, and requires the stream to terminate
+       with ``IEND``.
+
+    Never raises — on any exception we return ``False`` so the caller
+    can simply skip the icon.
+    """
+    if not data or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+
+    # v0.2.0.10: only use QImage on the main thread. From a Qt worker
+    # thread (e.g. the GUI Refresh button's _DiscoveryWorker), creating
+    # a QImage races with libgallium / Mesa state owned by the main
+    # GUI thread and segfaults the whole process — observed on
+    # openSUSE Tumbleweed Wayland 2026-04-27. The stdlib walker is
+    # strict enough on its own (CRC + dimension caps + IEND
+    # terminator), so off-main-thread callers get a slightly slower
+    # but crash-free path.
+    if threading.current_thread() is not threading.main_thread():
+        return _validate_png_stdlib(data)
+
+    # Fast path: PySide6 is already a GUI-team dependency, and QImage
+    # is strict about truncated/corrupt streams.
+    try:
+        from PySide6.QtGui import QImage  # type: ignore[import-not-found]
+    except ImportError:
+        QImage = None  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001 — Qt init can fail headless; fall through.
+        QImage = None  # type: ignore[assignment]
+
+    if QImage is not None:
+        try:
+            img = QImage()
+            if not img.loadFromData(data):
+                return False
+            if img.isNull():
+                return False
+            if img.width() <= 0 or img.height() <= 0:
+                return False
+            if img.width() > _MAX_PNG_WIDTH or img.height() > _MAX_PNG_HEIGHT:
+                return False
+            return True
+        except Exception:  # noqa: BLE001 — headless Qt edge cases.
+            log.debug("discovery: QImage validation crashed; falling back", exc_info=True)
+            # Fall through to the stdlib walker.
+
+    return _validate_png_stdlib(data)
+
+
+def _validate_png_stdlib(data: bytes) -> bool:
+    """Stdlib-only PNG chunk walker (fallback for ``_validate_png_bytes``)."""
+    try:
+        if len(data) < 8 + 12:  # magic + at least one chunk header+CRC
+            return False
+        pos = 8  # past the magic
+        saw_ihdr = False
+        saw_iend = False
+        width = 0
+        height = 0
+
+        while pos < len(data):
+            if pos + 8 > len(data):
+                return False
+            length = struct.unpack(">I", data[pos : pos + 4])[0]
+            chunk_type = data[pos + 4 : pos + 8]
+            if length > len(data):  # obviously bogus length prefix
+                return False
+            data_start = pos + 8
+            data_end = data_start + length
+            crc_end = data_end + 4
+            if crc_end > len(data):
+                return False
+
+            declared_crc = struct.unpack(">I", data[data_end:crc_end])[0]
+            actual_crc = zlib.crc32(data[pos + 4 : data_end]) & 0xFFFFFFFF
+            if declared_crc != actual_crc:
+                return False
+
+            if not saw_ihdr:
+                if chunk_type != b"IHDR" or length != 13:
+                    return False
+                width = struct.unpack(">I", data[data_start : data_start + 4])[0]
+                height = struct.unpack(">I", data[data_start + 4 : data_start + 8])[0]
+                if width == 0 or height == 0:
+                    return False
+                if width > _MAX_PNG_WIDTH or height > _MAX_PNG_HEIGHT:
+                    return False
+                saw_ihdr = True
+            elif chunk_type == b"IEND":
+                if length != 0:
+                    return False
+                saw_iend = True
+                pos = crc_end
+                break
+
+            pos = crc_end
+
+        return saw_ihdr and saw_iend
+    except (struct.error, ValueError, IndexError):
+        return False
+
+
+def _purge_reverse_open_entries(root: Path) -> None:
+    """Remove any existing per-app subdir whose app.toml points at a reverse-open shim.
+
+    Heals the pre-fix state where the discovery scan returned the
+    wayseam-installed reverse-open .exe shims as Windows apps. The
+    canonical shim directory is owned by ``reverse_open.sync`` and
+    queried via ``is_guest_shim_path`` so this sweep stays in sync
+    with the install layout if it ever moves.
+
+    Failure is non-fatal: a broken TOML or unreadable file is skipped,
+    and the next discovery refresh retries.
+    """
+    is_guest_shim_path = _is_guest_shim_path
+
+    if not root.exists():
+        return
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        toml_path = child / "app.toml"
+        if not toml_path.is_file():
+            continue
+        try:
+            data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if is_guest_shim_path(str(data.get("executable", ""))):
+            log.info("Purging stale reverse-open entry from discovered/: %s", child.name)
+            _safe_rmtree(child, root)
+
+
+def _safe_rmtree(path: Path, root: Path) -> None:
+    """Remove ``path`` if and only if it sits inside ``root``.
+
+    Guards against a crafted ``name`` resolving outside the discovered
+    tree (e.g. via a pre-existing symlink at the target location).
+    """
+    try:
+        resolved = path.resolve(strict=False)
+        root_resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return
+    if not resolved.is_relative_to(root_resolved):
+        log.warning("Refusing to remove %s: escapes discovered root %s", resolved, root_resolved)
+        return
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def scan(
+    cfg: Config,
+    timeout: int = DEFAULT_DISCOVERY_TIMEOUT,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+) -> list[DiscoveredApp]:
+    """Run guest-side discovery and return the parsed apps.
+
+    Thin wrapper over ``discover_apps`` so callers (CLI ``app refresh``,
+    GUI Refresh button, post-install hook) speak the redesigned public
+    API name. The underlying enumeration, junk filtering, and bounds
+    checks are unchanged from ``discover_apps``.
+    """
+    return discover_apps(cfg, timeout=timeout, progress_callback=progress_callback)
+
+
+def persist(
+    apps: list[DiscoveredApp],
+    target_dir: Path | None = None,
+    *,
+    replace: bool = True,
+) -> list[Path]:
+    """Persist discovered apps under ``~/.local/share/wayseam/apps/discovered/``.
+
+    Thin wrapper over ``persist_discovered``. Returns the list of
+    written ``app.toml`` paths.
+    """
+    return persist_discovered(apps, target_dir=target_dir, replace=replace)
+
+
+def run_if_first_boot(cfg: Config) -> None:
+    """Run discovery once when the persisted tree is empty (first boot).
+
+    Moved out of ``provisioner.ensure_ready`` (Step 3 of the redesign):
+    discovery is now explicit-only. Callers wanting the legacy "auto-
+    populate on first install" behaviour invoke this once at install
+    time (``install.sh`` -> ``wayseam app refresh``). ``ensure_ready``
+    no longer fires this path on every probe of the menu state.
+
+    Failure is non-fatal: a busy or still-booting guest skips the run
+    and the user can re-trigger discovery via the GUI Refresh button or
+    ``wayseam app refresh``.
+    """
+    try:
+        discovered_dir = discovered_apps_dir()
+        if discovered_dir.exists() and any(discovered_dir.iterdir()):
+            return  # already populated; user-triggered refresh stays in their hands.
+
+        log.info("First boot detected; auto-running discovery to populate the app menu...")
+        # v0.2.0.3: discovery uses the FreeRDP RemoteApp channel; on
+        # first pod boot Windows VM may still be initialising inside
+        # QEMU even though the RDP TCP port is open. Skip the run if
+        # the guest is not yet activation-responsive.
+        from wayseam.guest.agent import AgentClient
+
+        try:
+            AgentClient(cfg).health()
+        except Exception:  # noqa: BLE001
+            log.info("Windows guest agent not up yet; deferring discovery to a later run.")
+            return
+        apps = scan(cfg)
+        persist(apps)
+        log.info("First-boot discovery wrote %d app(s) to %s", len(apps), discovered_dir)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "First-boot discovery failed (non-fatal — run `wayseam app refresh` to retry): %s",
+            e,
+        )

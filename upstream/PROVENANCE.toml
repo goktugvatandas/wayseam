@@ -1,0 +1,143 @@
+# Files ported from WinPodX (https://github.com/kernalix7/winpodx), MIT.
+# upstream_base = d545584 (v0.10.4)
+
+[upstream]
+repo = "https://github.com/kernalix7/winpodx"
+base = "d545584"
+version = "0.10.4"
+
+[[file]]
+wayseam = "src/wayseam/guest/agent.py"
+upstream = "src/winpodx/core/agent.py"
+
+[[file]]
+wayseam = "src/wayseam/guest/agent_resync.py"
+upstream = "src/winpodx/core/agent_resync.py"
+
+[[file]]
+wayseam = "src/wayseam/apps.py"
+upstream = "src/winpodx/core/app.py"
+
+[[file]]
+wayseam = "src/wayseam/guest/discovery.py"
+upstream = "src/winpodx/core/discovery/__init__.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/mime_map.py"
+upstream = "src/winpodx/core/mime_map.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/url_schemes.py"
+upstream = "src/winpodx/core/url_schemes.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop_mode/freerdp.py"
+upstream = "src/winpodx/core/rdp.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop_mode/process.py"
+upstream = "src/winpodx/core/process.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/health.py"
+upstream = "src/winpodx/core/pod/health.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/ports.py"
+upstream = "src/winpodx/core/pod/ports.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/backend.py"
+upstream = "src/winpodx/backend/omarchy.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/backend_base.py"
+upstream = "src/winpodx/backend/base.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/backend_docker.py"
+upstream = "src/winpodx/backend/docker.py"
+
+[[file]]
+wayseam = "src/wayseam/vm/hostenv.py"
+upstream = "src/winpodx/backend/_hostenv.py"
+
+[[file]]
+wayseam = "src/wayseam/paths.py"
+upstream = "src/winpodx/utils/paths.py"
+
+[[file]]
+wayseam = "src/wayseam/token.py"
+upstream = "src/winpodx/utils/agent_token.py"
+
+[[file]]
+wayseam = "src/wayseam/tomlio.py"
+upstream = "src/winpodx/utils/toml_writer.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/entries.py"
+upstream = "src/winpodx/desktop/entry.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/icons.py"
+upstream = "src/winpodx/desktop/icons.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/menu.py"
+upstream = "src/winpodx/desktop/menu.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/mime.py"
+upstream = "src/winpodx/desktop/mime.py"
+
+[[file]]
+wayseam = "src/wayseam/desktop/notify.py"
+upstream = "src/winpodx/desktop/notify.py"
+
+[[file]]
+wayseam = "src/wayseam/present/window.py"
+upstream = "src/winpodx/wayseam/window.py"
+
+[[file]]
+wayseam = "src/wayseam/present/shm.py"
+upstream = "src/winpodx/wayseam/shm.py"
+
+[[file]]
+wayseam = "src/wayseam/present/launch.py"
+upstream = "src/winpodx/wayseam/launch.py"
+
+[[file]]
+wayseam = "src/wayseam/present/watch.py"
+upstream = "src/winpodx/wayseam/watch.py"
+
+[[file]]
+wayseam = "src/wayseam/present/audio.py"
+upstream = "src/winpodx/wayseam/audio.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/state.py"
+upstream = "src/winpodx/omarchy/state.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/mode.py"
+upstream = "src/winpodx/omarchy/mode.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/menu.py"
+upstream = "src/winpodx/omarchy/menu.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/plugin.py"
+upstream = "src/winpodx/omarchy/plugin.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/setup.py"
+upstream = "src/winpodx/omarchy/setup.py"
+
+[[file]]
+wayseam = "src/wayseam/omarchy/status.py"
+upstream = "src/winpodx/omarchy/status.py"
+
+[[file]]
+wayseam = "src/wayseam/cli_omarchy.py"
+upstream = "src/winpodx/cli/omarchy.py"

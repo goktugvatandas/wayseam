@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "goktugvatandas.wayseam",
+  "name": "Windows",
+  "version": "0.1.0",
+  "author": "Göktuğ Vatandaş",
+  "license": "MIT",
+  "description": "Wayseam: Windows apps as native Omarchy windows — mode switch, app visibility, menu placement.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Windows",
+    "description": "Switch between Wayseam Mode and Desktop Mode, choose which Windows apps show up, and pick where they land in the Omarchy menu.",
+    "category": "System",
+    "aliases": [
+      "wayseam",
+      "windows",
+      "wayseam"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "wayseamCommand": "wayseam"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15,
+        "description": "How often the panel re-reads Wayseam state while it is open."
+      },
+      {
+        "key": "wayseamCommand",
+        "type": "string",
+        "label": "wayseam command",
+        "defaultValue": "wayseam",
+        "description": "Executable used for every action. Resolved through a login shell, so ~/.local/bin works. Override with a full path to test against a stub."
+      }
+    ]
+  }
+}
