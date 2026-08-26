@@ -758,7 +758,7 @@ def test_wayseam_wgc_ring_writer_uses_seqlock_and_wsd1_blobs():
         "seq + 2); // even: published",
         "Thread.MemoryBarrier();",
         "RefreshPixels(session, 12)",
-        "EncodeDelta(state, session, state.Sequence)",
+        "EncodeDelta(state, session, state.Sequence, stalled)",
     ):
         assert marker in source
 

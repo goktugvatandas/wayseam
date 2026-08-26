@@ -12,6 +12,7 @@ from wayseam.present.shm import (
     HEADER_SLOT_DESC_OFFSET,
     RING_MAGIC,
     RING_VERSION,
+    SLOT_ACK_OFFSET,
     SLOT_DATA_OFFSET,
     SLOT_DESC_STRIDE,
     SLOT_FLAG_TOO_LARGE,
@@ -380,3 +381,12 @@ def test_partial_delta_without_base_asks_for_a_base_frame() -> None:
     assert isinstance(result, ShmNeedsBase)
     assert result.sequence == 4
     assert late.poll(None) is None  # consumed until a newer seq arrives
+
+
+def test_poll_acknowledges_applied_sequence_in_slot_header() -> None:
+    buf = build_ring()
+    publish(buf, 0, 2, full_blob(2, 2, 7))
+    source = ShmFrameSource("unused", 0, buffer=buf)
+    frame = source.poll(None)
+    assert isinstance(frame, WayseamFrame)
+    assert struct.unpack_from("<Q", buf, SLOT0 + SLOT_ACK_OFFSET)[0] == 7

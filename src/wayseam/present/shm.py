@@ -29,6 +29,7 @@ RING_FILE_NAME = "wayseam-ivshmem.bin"
 HEADER_SLOT_DESC_OFFSET = 64
 SLOT_DESC_STRIDE = 32
 SLOT_DATA_OFFSET = 64
+SLOT_ACK_OFFSET = 24  # host -> guest: last applied WSD1 sequence
 SLOT_FLAG_TOO_LARGE = 0x1
 MIN_SLOT_COUNT = 1
 MAX_SLOT_COUNT = 16
@@ -201,13 +202,23 @@ class ShmFrameSource:
             if not length_ok:
                 return None
             try:
-                return decode_wayseam_delta(blob, previous_pixels, in_place=True)
+                frame = decode_wayseam_delta(blob, previous_pixels, in_place=True)
             except AgentError as exc:
                 text = str(exc)
                 if "without a base" in text or "inconsistent" in text or "out-of-bounds" in text:
                     return ShmNeedsBase(seq)
                 return None
+            # Acknowledge the stream sequence we applied (slot header word @24)
+            # so the guest can drop the damage it kept pending for us.
+            self._acknowledge(frame.server_sequence)
+            return frame
         return None
+
+    def _acknowledge(self, sequence: int) -> None:
+        try:
+            struct.pack_into("<Q", self._buf, self._base + SLOT_ACK_OFFSET, max(0, int(sequence)))
+        except (struct.error, TypeError, ValueError):
+            pass
 
     def close(self) -> None:
         if self._mmap is not None:

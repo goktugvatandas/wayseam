@@ -236,6 +236,26 @@ public static class WayseamWgcCapture
         public int Sequence;
         public int SourceVersion;
         public DateTime LastSeen;
+        // Union of every rectangle published since the consumer last
+        // acknowledged a sequence. A single-slot ring overwrites publishes
+        // the host did not get to; folding the pending union into each new
+        // publish means whichever publish the host does apply is complete.
+        public bool HasPending;
+        public int PendingLeft, PendingTop, PendingRight, PendingBottom;
+
+        public void AddPending(int left, int top, int right, int bottom)
+        {
+            if (!HasPending)
+            {
+                PendingLeft = left; PendingTop = top; PendingRight = right; PendingBottom = bottom;
+                HasPending = true;
+                return;
+            }
+            if (left < PendingLeft) PendingLeft = left;
+            if (top < PendingTop) PendingTop = top;
+            if (right > PendingRight) PendingRight = right;
+            if (bottom > PendingBottom) PendingBottom = bottom;
+        }
     }
 
     private static readonly object SessionsLock = new object();
@@ -757,6 +777,7 @@ public static class WayseamWgcCapture
         public volatile bool Stop;
         public string Error = "";
         public long Published;
+        public DateTime LastPublish;
     }
 
     private static string RingEnsureMapped()
@@ -1164,7 +1185,15 @@ public static class WayseamWgcCapture
                     {
                         lock (state.Sync)
                         {
-                            blob = EncodeDelta(state, session, state.Sequence);
+                            // The host writes the WSD1 sequence it last applied
+                            // at slot+24. Everything pending was folded into that
+                            // (or a later) publish, so an ack at our sequence
+                            // means the host is complete.
+                            long ack = Marshal.ReadInt64(RingSlotBase(stream.Slot), 24);
+                            if (ack >= state.Sequence) state.HasPending = false;
+                            bool stalled = state.HasPending && ack < state.Sequence &&
+                                (DateTime.UtcNow - stream.LastPublish).TotalMilliseconds > 120;
+                            blob = EncodeDelta(state, session, state.Sequence, stalled);
                         }
                     }
                 }
@@ -1177,6 +1206,7 @@ public static class WayseamWgcCapture
                 if (blob.Length > 36)
                 {
                     RingPublish(stream.Slot, blob);
+                    stream.LastPublish = DateTime.UtcNow;
                     Interlocked.Increment(ref stream.Published);
                     RingDescriptor(stream.Slot, stream.Hwnd.ToInt64(), 1);
                 }
@@ -1321,6 +1351,10 @@ public static class WayseamWgcCapture
             state.Width = width;
             state.Height = height;
             frame.Dispose();
+            frame = null;
+            // Leave further queued frames in the pool for the next call: a
+            // frame fetched and dropped here would lose its dirty regions.
+            if (processed >= 4) break;
             frame = state.Pool.TryGetNextFrame();
         }
         if (frame != null) frame.Dispose();
@@ -1346,6 +1380,15 @@ public static class WayseamWgcCapture
         SessionState session,
         int baseSequence)
     {
+        return EncodeDelta(state, session, baseSequence, false);
+    }
+
+    private static byte[] EncodeDelta(
+        StreamState state,
+        SessionState session,
+        int baseSequence,
+        bool republishPending)
+    {
         int width = session.Width;
         int height = session.Height;
         int stride = checked(width * 4);
@@ -1359,6 +1402,25 @@ public static class WayseamWgcCapture
         int maxX = full ? width - 1 : session.DirtyRight - 1;
         int maxY = full ? height - 1 : session.DirtyBottom - 1;
         bool changed = !current && maxX >= minX && maxY >= minY;
+        if (!full && state.HasPending && (changed || republishPending))
+        {
+            // Carry damage the consumer may not have received yet.
+            int pl = Math.Max(0, state.PendingLeft), pt = Math.Max(0, state.PendingTop);
+            int pr = Math.Min(width - 1, state.PendingRight - 1), pb = Math.Min(height - 1, state.PendingBottom - 1);
+            if (pr >= pl && pb >= pt)
+            {
+                if (!changed) { minX = pl; minY = pt; maxX = pr; maxY = pb; }
+                else
+                {
+                    if (pl < minX) minX = pl;
+                    if (pt < minY) minY = pt;
+                    if (pr > maxX) maxX = pr;
+                    if (pb > maxY) maxY = pb;
+                }
+                changed = true;
+            }
+        }
+        if (full) { state.HasPending = false; }
         int sequence = state.Sequence;
         int rectWidth = changed ? maxX - minX + 1 : 0;
         int rectHeight = changed ? maxY - minY + 1 : 0;
@@ -1387,6 +1449,7 @@ public static class WayseamWgcCapture
                     rowBytes);
             }
         }
+        if (changed && !full) state.AddPending(minX, minY, maxX + 1, maxY + 1);
         state.Width = width;
         state.Height = height;
         state.Sequence = sequence;
