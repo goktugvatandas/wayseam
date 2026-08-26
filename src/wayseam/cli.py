@@ -67,7 +67,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pod_sub = pod.add_subparsers(dest="pod_command")
     pod_start = pod_sub.add_parser("start", help="start the VM and wait for it")
     pod_start.add_argument("--timeout", type=int, default=0, help="boot timeout override (s)")
-    pod_sub.add_parser("stop", help="stop the VM")
+    pod_start.add_argument("--no-wait", action="store_true", help="return once the container is up")
+    pod_sub.add_parser("stop", help="stop the VM (Wayseam windows close first)")
+    pod_restart = pod_sub.add_parser("restart", help="stop and start the VM")
+    pod_restart.add_argument("--no-wait", action="store_true", help="return once the container is up")
     pod_sub.add_parser("status", help="show VM status")
 
     agent = sub.add_parser("agent", help="Guest agent operations")
@@ -123,17 +126,55 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retire_presentation() -> None:
+    """Stop the watcher, presenters and desktop client before the VM goes away."""
+    from wayseam.omarchy.mode import (
+        desktop_session_pid,
+        presenter_pids,
+        terminate_pid,
+        watcher_pid,
+    )
+
+    watcher = watcher_pid()
+    if watcher:
+        terminate_pid(watcher)
+    for pid in presenter_pids():
+        terminate_pid(pid)
+    desktop = desktop_session_pid()
+    if desktop:
+        terminate_pid(desktop)
+
+
+def _start_pod(cfg, *, wait: bool):
+    from wayseam.vm.lifecycle import PodState, PodStatus, get_backend, start_pod
+
+    if wait:
+        return start_pod(cfg)
+    backend = get_backend(cfg)
+    try:
+        backend.start()
+    except Exception as exc:  # noqa: BLE001
+        return PodStatus(state=PodState.ERROR, error=str(exc))
+    return PodStatus(state=PodState.STARTING, ip=cfg.rdp.ip)
+
+
 def _cmd_pod(args: argparse.Namespace) -> int:
     from wayseam.config import Config
-    from wayseam.vm.lifecycle import PodState, pod_status, start_pod, stop_pod
+    from wayseam.vm.lifecycle import PodState, pod_status, stop_pod
 
     cfg = Config.load()
     if args.pod_command == "start":
         if args.timeout:
             cfg.pod.boot_timeout = args.timeout
-        status = start_pod(cfg)
+        status = _start_pod(cfg, wait=not args.no_wait)
     elif args.pod_command == "stop":
+        _retire_presentation()
         status = stop_pod(cfg)
+    elif args.pod_command == "restart":
+        _retire_presentation()
+        status = stop_pod(cfg)
+        if status.state is not PodState.ERROR:
+            status = _start_pod(cfg, wait=not args.no_wait)
     else:
         status = pod_status(cfg)
     print(f"State:    {status.state.value}")

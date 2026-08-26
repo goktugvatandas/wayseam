@@ -215,6 +215,26 @@ Panel {
     ensureCursor()
   }
 
+  // VM lifecycle: a click arms an inline confirmation; only the confirm
+  // button runs the command (stop/restart close every Windows window).
+  property string pendingPod: ""
+  readonly property var podActions: ["start", "stop", "restart"]
+
+  function armPod(action) {
+    if (!action || actionProc.running) return
+    if (action === "start" && vmRunning) return
+    if (action !== "start" && !vmRunning) return
+    pendingPod = action
+  }
+
+  function confirmPod() {
+    var action = pendingPod
+    pendingPod = ""
+    if (!action) return
+    var label = Model.podLabel(action)
+    runAction(Model.podCommand(wayseamCommand, action), label.replace(" VM", "ing the VM") + "…")
+  }
+
   function runAction(command, status) {
     if (!command || actionProc.running) return false
     actionStatus = status || ""
@@ -265,6 +285,7 @@ Panel {
   }
 
   function actionFinished(exitCode, label) {
+    pendingPod = ""
     if (exitCode !== 0) {
       lastError = label + " failed (exit " + exitCode + ")"
       pendingMode = ""
@@ -281,6 +302,7 @@ Panel {
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: if (opened) {
+    pendingPod = ""
     cursorActive = false
     focusSection = "mode"
     pointerGate.reset()
@@ -530,6 +552,96 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+          }
+
+          // ---------- Windows VM ----------
+          PanelSeparator { foreground: root.foreground }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "WINDOWS VM" + (root.loaded ? (root.vmRunning ? " · RUNNING" : " · STOPPED") : "")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Row {
+              id: podRow
+              visible: root.pendingPod === ""
+              width: parent.width
+              spacing: Style.space(6)
+              opacity: root.loaded ? 1.0 : 0.45
+
+              readonly property real cellWidth: (width - spacing * 2) / 3
+
+              Repeater {
+                model: root.podActions
+                Button {
+                  required property var modelData
+                  required property int index
+                  width: podRow.cellWidth
+                  iconText: modelData === "start" ? "󰐊" : (modelData === "stop" ? "󰓛" : "󰑐")
+                  iconSize: Style.font.title
+                  text: modelData === "start" ? "Start" : (modelData === "stop" ? "Stop" : "Restart")
+                  fontSize: Style.font.bodySmall
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                  bordered: true
+                  enabled: root.loaded && !actionProc.running && (modelData === "start" ? !root.vmRunning : root.vmRunning)
+                  opacity: enabled ? 1.0 : 0.5
+                  tooltipText: Model.podLabel(String(modelData))
+                  onClicked: root.armPod(String(modelData))
+                }
+              }
+            }
+
+            Column {
+              visible: root.pendingPod !== ""
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                text: Model.podConfirmText(root.pendingPod)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+
+              Row {
+                id: podConfirmRow
+                width: parent.width
+                spacing: Style.space(6)
+                readonly property real cellWidth: (width - spacing) / 2
+
+                Button {
+                  width: podConfirmRow.cellWidth
+                  text: "Cancel"
+                  fontSize: Style.font.bodySmall
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  onClicked: root.pendingPod = ""
+                }
+
+                Button {
+                  width: podConfirmRow.cellWidth
+                  iconText: root.pendingPod === "start" ? "󰐊" : (root.pendingPod === "stop" ? "󰓛" : "󰑐")
+                  text: Model.podLabel(root.pendingPod)
+                  fontSize: Style.font.bodySmall
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  selected: true
+                  onClicked: root.confirmPod()
+                }
+              }
             }
           }
 

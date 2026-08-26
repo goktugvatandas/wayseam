@@ -258,6 +258,30 @@ function refreshAppsCommand(command) {
   return exe(command) + " apps refresh"
 }
 
+// VM lifecycle from the applet. `start` returns as soon as the container is
+// up (the panel's state refresh shows readiness); `stop` and `restart` retire
+// the presenters first so no window is left pointing at a gone guest.
+function podCommand(command, action) {
+  if (action === "start") return exe(command) + " pod start --no-wait"
+  if (action === "stop") return exe(command) + " pod stop"
+  if (action === "restart") return exe(command) + " pod restart"
+  return ""
+}
+
+function podLabel(action) {
+  if (action === "start") return "Start VM"
+  if (action === "stop") return "Stop VM"
+  if (action === "restart") return "Restart VM"
+  return ""
+}
+
+function podConfirmText(action) {
+  if (action === "stop") return "Stop the Windows VM? Open Windows apps will close."
+  if (action === "restart") return "Restart the Windows VM? Open Windows apps will close."
+  if (action === "start") return "Start the Windows VM?"
+  return ""
+}
+
 function runAppCommand(command, slug) {
   return exe(command) + " run " + shellQuote(slug)
 }

@@ -59,11 +59,14 @@ def _state_doc() -> dict:
         (["omarchy", "apps", "visibility", "--all"], {"all": True, "none": False}),
         (["omarchy", "plugin", "install"], {"plugin_command": "install"}),
         (["omarchy", "plugin", "status"], {"plugin_command": "status"}),
+        (["pod", "restart", "--no-wait"], {"pod_command": "restart", "no_wait": True}),
+        (["pod", "start", "--no-wait"], {"pod_command": "start", "no_wait": True}),
+        (["pod", "stop"], {"pod_command": "stop"}),
     ],
 )
 def test_parser_exposes_every_omarchy_subcommand(argv: list[str], expected: dict) -> None:
     args = _parse(argv)
-    assert args.command == argv[1]
+    assert args.command == (argv[1] if argv[0] == "omarchy" else argv[0])
     for key, value in expected.items():
         assert getattr(args, key) == value
 
