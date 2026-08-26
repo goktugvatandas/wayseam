@@ -13,6 +13,7 @@ from typing import Any
 PLUGIN_ID = "goktugvatandas.wayseam"
 _SHELL_TIMEOUT = 10
 _ENABLE_TIMEOUT = 20
+_RESTART_TIMEOUT = 60
 
 
 class PluginError(RuntimeError):
@@ -93,8 +94,9 @@ def install_plugin(
     source: Path | None = None,
     link: Path | None = None,
     run: Callable[..., Any] = subprocess.run,
+    restart_shell: bool = True,
 ) -> dict[str, Any]:
-    """Link the plugin, rescan the shell's plugins and enable the applet."""
+    """Link the plugin, rescan the shell's plugins, enable the applet, restart the shell."""
     source = source or plugin_source_dir()
     link = link or plugin_link_path()
     changed = ensure_plugin_link(source, link)
@@ -119,6 +121,13 @@ def install_plugin(
     result["enabled"] = ok
     if not ok:
         result["warnings"].append(detail)
+    # The shell's QML engine keeps the component it already loaded even after
+    # a plugin rescan, so an updated applet kept showing its previous code
+    # until the shell restarted. Restart it (best-effort) so what is linked
+    # is what runs.
+    if restart_shell:
+        ok, _detail = _run_tool(["omarchy-restart-shell"], timeout=_RESTART_TIMEOUT, run=run)
+        result["shell_restarted"] = ok
     return result
 
 

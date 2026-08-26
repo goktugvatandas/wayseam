@@ -92,6 +92,7 @@ def test_install_plugin_links_rescans_and_enables(tmp_path: Path) -> None:
     assert runner.calls == [
         ["omarchy-shell", "shell", "rescanPlugins"],
         ["omarchy-plugin-enable", PLUGIN_ID],
+        ["omarchy-restart-shell"],
     ]
 
     again = install_plugin(source=source, link=link, run=runner)
