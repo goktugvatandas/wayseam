@@ -363,25 +363,37 @@ def _png_dimensions(path: Path) -> tuple[int, int] | None:
     return width, height
 
 
-def _hicolor_bucket(path: Path) -> int:
-    """Pick the hicolor size directory a PNG belongs in.
+_HICOLOR_SIZES = (16, 22, 24, 32, 48, 64, 96, 128, 256, 512)
 
-    Uses the larger edge, so a non-square icon is not filed under a size it
-    overflows. Falls back to 32 when the file is not a readable PNG — the same
-    directory everything used to land in, so a malformed file behaves as before
-    rather than disappearing somewhere unexpected.
+
+def _hicolor_buckets(path: Path) -> list[int]:
+    """Standard hicolor size directories a PNG should be installed into.
+
+    Launchers only look in the standard sizes (the Omarchy menu asks for
+    48px-ish icons); a PNG filed under its literal size — UWP logos come as
+    44x44 or 88x88 — is invisible to them. Install the file into every
+    standard directory it can serve without upscaling, plus the next larger
+    one so small sources still resolve at the size launchers request.
     """
     dims = _png_dimensions(path)
-    if dims is None:
-        return _DEFAULT_PNG_SIZE
-    return max(dims)
+    size = max(dims) if dims else _DEFAULT_PNG_SIZE
+    fits = [s for s in _HICOLOR_SIZES if s <= size]
+    larger = [s for s in _HICOLOR_SIZES if s > size]
+    buckets = fits + larger[:1]
+    return buckets or [_DEFAULT_PNG_SIZE]
 
 
-def _remove_stale_icon_copies(icon_name: str, *, keep: Path) -> None:
+def _hicolor_bucket(path: Path) -> int:
+    """Largest standard hicolor directory for a PNG (kept for callers/tests)."""
+    return _hicolor_buckets(path)[-1]
+
+
+def _remove_stale_icon_copies(icon_name: str, *, keep: Path | set[Path]) -> None:
     """Delete this icon from every sized hicolor directory except ``keep``."""
+    keep_set = {keep} if isinstance(keep, Path) else set(keep)
     for size_dir in icons_dir().glob("*x*/apps"):
         stale = size_dir / f"{icon_name}.png"
-        if stale == keep:
+        if stale in keep_set:
             continue
         try:
             stale.unlink(missing_ok=True)
@@ -410,16 +422,18 @@ def _install_icon(app: AppInfo) -> str:
         dest_dir = icons_dir() / "scalable" / "apps"
         dest = dest_dir / f"{icon_name}.svg"
     elif suffix == ".png":
-        # Discovered apps often only have PNG from extracted Windows resources,
-        # and those come at whatever size the resource happened to be — UWP
-        # logos are commonly 44x44 or 88x88, not 32x32.
-        bucket = _hicolor_bucket(src)
-        dest_dir = icons_dir() / f"{bucket}x{bucket}" / "apps"
-        dest = dest_dir / f"{icon_name}.png"
-        # An upgrade can move an icon between buckets (everything used to land
-        # in 32x32). Drop the old copies first, or the theme keeps serving a
-        # stale one from whichever directory it searches first.
-        _remove_stale_icon_copies(icon_name, keep=dest)
+        # Discovered apps only have PNGs extracted from Windows resources at
+        # whatever size the resource was (UWP logos: 44x44, 88x88). Install
+        # into the standard hicolor sizes so launchers actually find them.
+        dests = [
+            icons_dir() / f"{bucket}x{bucket}" / "apps" / f"{icon_name}.png"
+            for bucket in _hicolor_buckets(src)
+        ]
+        _remove_stale_icon_copies(icon_name, keep=set(dests))
+        for dest in dests:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest, follow_symlinks=False)
+        return icon_name
     else:
         log.warning(
             "Icon %s for app %s is not SVG or PNG (%s); "
