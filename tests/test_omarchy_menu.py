@@ -71,8 +71,10 @@ def test_windows_apps_placement_writes_action_rows_omarchy4_understands(
     parsed = _parse_jsonc(text)
     assert BEGIN_MARKER in text and END_MARKER in text
     assert parsed["windows-apps"] == {"icon": "", "label": "Windows Apps"}
+    # Rows carry a per-app Nerd Font glyph (the menu cannot draw image icons
+    # for JSON rows); Calculator gets the calculator glyph.
     assert parsed["windows-apps.calculator"] == {
-        "icon": "",
+        "icon": "\U000f00ec",
         "label": "Calculator",
         "action": "uwsm-app -- gtk-launch wayseam-calculator.desktop",
     }

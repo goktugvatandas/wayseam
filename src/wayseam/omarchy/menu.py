@@ -111,6 +111,44 @@ def menu_action(slug: str) -> str:
     return f"uwsm-app -- gtk-launch wayseam-{slug}.desktop"
 
 
+# Omarchy's menu draws JSON rows with a Nerd Font glyph (image icons exist
+# only for its own desktop-entry rows), so give each Windows app the closest
+# recognisable glyph instead of one generic symbol for the whole list.
+_GLYPHS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("explorer", "file"), "\U000f0256"),      # 󰉖 folder
+    (("settings", "control"), "\U000f0493"),   # 󰒓 cog
+    (("notepad", "note", "text", "editor"), "\U000f039e"),  # 󰎞 note
+    (("terminal", "powershell", "cmd", "prompt", "console"), "\U000f018d"),  # 󰆍 console
+    (("calculator", "calc"), "\U000f00ec"),    # 󰃬 calculator
+    (("edge", "chrome", "firefox", "browser", "internet"), "\U000f059f"),  # 󰖟 web
+    (("mail", "outlook", "thunderbird"), "\U000f01ee"),  # 󰇮 email
+    (("word", "writer", "docs", "document"), "\U000f0219"),  # 󰈙 document
+    (("excel", "sheet", "calc"), "\U000f021b"),  # 󰈛 table
+    (("powerpoint", "slides", "presentation"), "\U000f0227"),  # 󰈧 presentation
+    (("photo", "affinity", "paint", "image", "designer", "gimp", "draw"), "\U000f02e9"),  # 󰋩 image
+    (("music", "media", "player", "video", "vlc", "movies"), "\U000f0388"),  # 󰎈 play circle
+    (("camera",), "\U000f0100"),               # 󰄀 camera
+    (("clock", "alarm", "calendar"), "\U000f0150"),  # 󰅐 clock
+    (("store", "shop"), "\U000f0110"),         # 󰄐 store
+    (("game", "xbox", "steam"), "\U000f0297"),  # 󰊗 gamepad
+    (("map",), "\U000f034d"),                  # 󰍍 map
+    (("weather",), "\U000f0599"),              # 󰖙 weather
+    (("phone",), "\U000f03f2"),                # 󰏲 phone
+    (("security", "defender", "antivirus"), "\U000f0483"),  # 󰒃 shield
+    (("disk", "cleanup", "defrag", "optimizer", "iscsi", "system", "tools", "admin"), "\U000f0493"),  # cog
+    (("character",), "\U000f0a1b"),            # 󰨛 characters
+)
+
+
+def menu_glyph(app: _MenuApp) -> str:
+    """Pick a Nerd Font glyph for an app from its slug/name; MENU_ICON otherwise."""
+    haystack = f"{app.name} {app.full_name or ''}".casefold()
+    for needles, glyph in _GLYPHS:
+        if any(needle in haystack for needle in needles):
+            return glyph
+    return MENU_ICON
+
+
 def _managed_block(visible: list[_MenuApp]) -> str:
     entries: list[tuple[str, dict[str, str]]] = [
         ("windows-apps", {"icon": MENU_ICON, "label": "Windows Apps"})
@@ -120,7 +158,7 @@ def _managed_block(visible: list[_MenuApp]) -> str:
             (
                 f"windows-apps.{app.name}",
                 {
-                    "icon": MENU_ICON,
+                    "icon": menu_glyph(app),
                     "label": app.full_name or app.name,
                     "action": menu_action(app.name),
                 },
