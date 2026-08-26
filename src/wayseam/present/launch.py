@@ -155,6 +155,26 @@ public static class WayseamLaunchWindow {{
         if (explorerProcess) return cls == "cabinetwclass" || cls == "explorewclass";
         return true;
     }}
+    public delegate bool ChildProc(IntPtr hwnd, IntPtr state);
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr parent, ChildProc callback, IntPtr state);
+    // UWP apps: the visible window is an ApplicationFrameHost frame whose
+    // Windows.UI.Core.CoreWindow child belongs to the app's process.
+    public static IntPtr FindHostedFrame(uint wantedPid) {{
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr frame, IntPtr state) {{
+            if (!IsWindowVisible(frame) || ClassName(frame) != "ApplicationFrameWindow") return true;
+            bool hosts = false;
+            EnumChildWindows(frame, delegate(IntPtr child, IntPtr s2) {{
+                uint pid; GetWindowThreadProcessId(child, out pid);
+                if (pid == wantedPid && ClassName(child) == "Windows.UI.Core.CoreWindow") {{ hosts = true; return false; }}
+                return true;
+            }}, IntPtr.Zero);
+            if (hosts) {{ found = frame; return false; }}
+            return true;
+        }}, IntPtr.Zero);
+        return found;
+    }}
     public static IntPtr FindVisible(uint wantedPid, bool explorerProcess) {{
         IntPtr found = IntPtr.Zero;
         long bestArea = 0;
@@ -174,6 +194,7 @@ public static class WayseamLaunchWindow {{
             }}
             return true;
         }}, IntPtr.Zero);
+        if (found == IntPtr.Zero) found = FindHostedFrame(wantedPid);
         return found;
     }}
 

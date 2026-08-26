@@ -41,7 +41,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:AgentVersion = '0.2.39-wayseam'
+$script:AgentVersion = '0.2.40-wayseam'
 $script:BlockedPointerButtons = @{}
 $script:StartedAt    = (Get-Date).ToUniversalTime().ToString('o')
 $script:OemDir       = 'C:\OEM'
@@ -233,6 +233,8 @@ public static class WayseamNativeCapture {
   }
   public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr state);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  public delegate bool ChildEnumProc(IntPtr hwnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, ChildEnumProc callback, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
@@ -834,12 +836,21 @@ public static class WayseamNativeCapture {
 
   public static WindowInfo[] OwnedWindows(IntPtr root) {
     var result = new System.Collections.Generic.List<WindowInfo>();
+    uint rootPid; uint rootThread = GetWindowThreadProcessId(root, out rootPid);
     EnumWindows(delegate(IntPtr hwnd, IntPtr state) {
       if (hwnd == root || !IsWindowVisible(hwnd)) return true;
       IntPtr owner = GetWindow(hwnd, 4); // GW_OWNER
       IntPtr ancestor = owner;
       while (ancestor != IntPtr.Zero && ancestor != root) ancestor = GetWindow(ancestor, 4);
-      if (ancestor != root) return true;
+      if (ancestor != root) {
+        // Classic menus ("Show more options"), tooltips and XAML popups are
+        // unowned top-levels on the root's UI thread: treat them as owned so
+        // the presenter overlays them too.
+        uint pid; uint thread = GetWindowThreadProcessId(hwnd, out pid);
+        var popupClass = new System.Text.StringBuilder(256);
+        GetClassName(hwnd, popupClass, popupClass.Capacity);
+        if (thread != rootThread || !IsThreadPopupClass(popupClass.ToString())) return true;
+      }
       RECT rect;
       if (!GetVisibleRect(hwnd, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return true;
       var title = new System.Text.StringBuilder(512);
@@ -868,6 +879,28 @@ public static class WayseamNativeCapture {
       (long)height * 10 >= (long)ownerHeight * 9;
   }
 
+  // UWP apps run inside ApplicationFrameHost.exe: the visible top-level is
+  // the frame, the app itself owns a Windows.UI.Core.CoreWindow child. Report
+  // the hosted app's process so windows attribute to the right Wayseam app.
+  public static uint HostedPid(IntPtr frame) {
+    uint framePid; GetWindowThreadProcessId(frame, out framePid);
+    uint hosted = 0;
+    EnumChildWindows(frame, delegate(IntPtr child, IntPtr state) {
+      var cls = new System.Text.StringBuilder(256);
+      GetClassName(child, cls, cls.Capacity);
+      if (cls.ToString() == "Windows.UI.Core.CoreWindow") {
+        uint pid; GetWindowThreadProcessId(child, out pid);
+        if (pid != 0 && pid != framePid) { hosted = pid; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return hosted;
+  }
+
+  private static bool IsThreadPopupClass(string cls) {
+    return cls == "#32768" || cls == "Xaml_WindowedPopupClass" || cls == "tooltips_class32";
+  }
+
   private static string ProcessPath(uint pid) {
     IntPtr process = OpenProcess(0x1000, false, pid); // PROCESS_QUERY_LIMITED_INFORMATION
     if (process == IntPtr.Zero) return "";
@@ -889,12 +922,16 @@ public static class WayseamNativeCapture {
       if (!IsIndependentTopLevel(hwnd, owner, rect)) return true;
       uint pid;
       GetWindowThreadProcessId(hwnd, out pid);
-      string processPath = ProcessPath(pid);
-      if (pid == 0 || String.IsNullOrWhiteSpace(processPath)) return true;
       var title = new System.Text.StringBuilder(512);
       var className = new System.Text.StringBuilder(256);
       GetWindowText(hwnd, title, title.Capacity);
       GetClassName(hwnd, className, className.Capacity);
+      if (className.ToString() == "ApplicationFrameWindow") {
+        uint hosted = HostedPid(hwnd);
+        if (hosted != 0) pid = hosted;
+      }
+      string processPath = ProcessPath(pid);
+      if (pid == 0 || String.IsNullOrWhiteSpace(processPath)) return true;
       result.Add(new WindowInfo {
         hwnd = hwnd.ToInt64(), owner = owner.ToInt64(), pid = (int)pid,
         process_path = processPath, title = title.ToString(),
