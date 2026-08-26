@@ -65,6 +65,21 @@ class ShmTooLarge:
     sequence: int
 
 
+class ShmNeedsBase:
+    """The slot holds a partial delta but the reader has no base frame yet.
+
+    Happens whenever a presenter attaches after the window's first full frame
+    was superseded (apps that animate on open). The pump must fetch one full
+    frame over HTTP; subsequent deltas then apply in place.
+    """
+
+    __slots__ = ("sequence",)
+
+    def __init__(self, sequence: int) -> None:
+        self.sequence = sequence
+
+
+
 @dataclass(frozen=True)
 class RingHeader:
     """Parsed, sanity-checked copy of the ring header at offset 0."""
@@ -164,7 +179,7 @@ class ShmFrameSource:
 
     def poll(
         self, previous_pixels: bytes | bytearray | None,
-    ) -> WayseamFrame | ShmTooLarge | None:
+    ) -> WayseamFrame | ShmTooLarge | ShmNeedsBase | None:
         """Return the newest published frame, a too-large sentinel, or ``None``."""
         base = self._base
         for _ in range(POLL_ATTEMPTS):
@@ -187,7 +202,10 @@ class ShmFrameSource:
                 return None
             try:
                 return decode_wayseam_delta(blob, previous_pixels, in_place=True)
-            except AgentError:
+            except AgentError as exc:
+                text = str(exc)
+                if "without a base" in text or "inconsistent" in text or "out-of-bounds" in text:
+                    return ShmNeedsBase(seq)
                 return None
         return None
 

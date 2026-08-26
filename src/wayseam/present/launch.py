@@ -42,6 +42,15 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    # A presenter the watcher has not reaped yet is a zombie: gone for every
+    # purpose that matters here (it holds no window), so its claim is stale.
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return True
+    for line in status.splitlines():
+        if line.startswith("State:"):
+            return not line.split()[1].startswith("Z")
     return True
 
 

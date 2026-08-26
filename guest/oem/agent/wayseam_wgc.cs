@@ -351,6 +351,24 @@ public static class WayseamWgcCapture
     private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     private const int DWMWCP_DEFAULT = 0;
     private const int DWMWCP_DONOTROUND = 1;
+    private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+    private const int DWMSBT_AUTO = 0;
+    private const int DWMSBT_NONE = 1;
+
+    private static void SetSystemBackdrop(IntPtr hwnd, int kind)
+    {
+        // Mica/Acrylic backdrops are composed by DWM from what lies behind the
+        // window, so Windows Graphics Capture returns those regions as
+        // transparent — File Explorer presented as a see-through tile. With
+        // the backdrop off the app paints a solid background we can capture.
+        try
+        {
+            int value = kind;
+            DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref value, 4);
+        }
+        catch { }
+    }
+
     private const int DWMWA_BORDER_COLOR = 34;
     private const int DWMWA_COLOR_NONE = unchecked((int)0xFFFFFFFE);
     private const int DWMWA_COLOR_DEFAULT = unchecked((int)0xFFFFFFFF);
@@ -434,6 +452,7 @@ public static class WayseamWgcCapture
                 Sessions[key] = state;
                 SetCornerPreference(hwnd, DWMWCP_DONOTROUND);
                 SetBorderColor(hwnd, DWMWA_COLOR_NONE);
+                SetSystemBackdrop(hwnd, DWMSBT_NONE);
                 SetMaximizeBox(hwnd, false);
                 NudgeRepaint(hwnd);
             }
@@ -475,6 +494,7 @@ public static class WayseamWgcCapture
             expected.Dispose();
             SetCornerPreference(hwnd, DWMWCP_DEFAULT);
             SetBorderColor(hwnd, DWMWA_COLOR_DEFAULT);
+            SetSystemBackdrop(hwnd, DWMSBT_AUTO);
             SetMaximizeBox(hwnd, true);
         }
     }

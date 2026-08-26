@@ -37,6 +37,7 @@ from wayseam.paths import runtime_dir
 from wayseam.present.shm import (
     ShmFrameSource,
     ShmInputWriter,
+    ShmNeedsBase,
     ShmTooLarge,
     default_ring_path,
 )
@@ -205,9 +206,13 @@ class LatestFramePump:
                 if failures > 20:
                     self.transport = "http"
                     return
-            if isinstance(result, ShmTooLarge):
+            if isinstance(result, (ShmTooLarge, ShmNeedsBase)):
+                # Too large for the slot, or a delta we have no base for
+                # (attached after the first full frame): one HTTP full frame
+                # gives the canvas every later delta applies to.
                 try:
                     self._http_full_frame()
+                    self.error = None
                 except AgentWindowGoneError:
                     self.window_gone.set()
                     return
@@ -215,6 +220,7 @@ class LatestFramePump:
                     self.error = f"{type(exc).__name__}: {exc}"
             elif result is not None:
                 failures = 0
+                self.error = None
                 self._publish(result)
                 continue  # drain bursts without sleeping
             now = time.monotonic()
@@ -222,6 +228,8 @@ class LatestFramePump:
                 last_keepalive = now
                 try:
                     self.client.shm_assign(self.hwnd)
+                    if self.error and "shm" in self.error:
+                        self.error = None  # the agent is back; stop showing the hiccup
                 except AgentWindowGoneError:
                     self.window_gone.set()
                     return

@@ -227,6 +227,21 @@ class PresentationBackoff:
         return self._failures.get(hwnd, 0)
 
 
+def _reap_children() -> None:
+    """Collect exited presenters so they never linger as zombies.
+
+    A zombie still answers ``kill -0``, which kept its HWND claim alive and
+    stopped the watcher from re-presenting the window.
+    """
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
 def run_watcher(*, poll_interval: float = 0.2, idle_seconds: float = 5.0) -> int:
     """Present missing known roots until Wayseam Mode becomes idle."""
     directory = runtime_dir()
@@ -308,6 +323,7 @@ def run_watcher(*, poll_interval: float = 0.2, idle_seconds: float = 5.0) -> int
                         )
                     else:
                         backoff.started(window.hwnd)
+            _reap_children()
             time.sleep(poll_interval)
     return 0
 

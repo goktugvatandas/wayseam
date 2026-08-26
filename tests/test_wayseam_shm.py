@@ -17,6 +17,7 @@ from wayseam.present.shm import (
     SLOT_FLAG_TOO_LARGE,
     RingHeader,
     ShmFrameSource,
+    ShmNeedsBase,
     ShmTooLarge,
     default_ring_path,
     open_ring,
@@ -362,3 +363,20 @@ def test_input_writer_backpressure_when_ring_is_full():
     buf[m.INPUT_HEAD_OFFSET:m.INPUT_HEAD_OFFSET + 8] = _s.pack("<Q", m.INPUT_ENTRY_COUNT - 1)
     writer = m.ShmInputWriter(buf)
     assert writer.move(0x1, 1, 1) is False  # guest stalled -> HTTP fallback
+
+
+def test_partial_delta_without_base_asks_for_a_base_frame() -> None:
+    buf = build_ring()
+    publish(buf, 0, 2, full_blob(4, 4, 3))
+    source = ShmFrameSource("unused", 0, buffer=buf)
+    base = source.poll(None)
+    assert isinstance(base, WayseamFrame)
+    # A reader that attaches after the full frame was superseded only sees a
+    # partial delta: it must report that it needs a base, not stay blank.
+    partial = wsd1(4, 4, 5, 1, 1, 2, 2, b"\x10\x20\x30\xff" * 4)
+    publish(buf, 0, 4, partial)
+    late = ShmFrameSource("unused", 0, buffer=buf)
+    result = late.poll(None)
+    assert isinstance(result, ShmNeedsBase)
+    assert result.sequence == 4
+    assert late.poll(None) is None  # consumed until a newer seq arrives
