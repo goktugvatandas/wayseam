@@ -10,6 +10,10 @@ moved, focused, scrolled and closed like any Linux window, launched from the
 Omarchy menu, with the Windows desktop itself out of sight. It is the
 Parallels Coherence / VMware Unity idea, built for Omarchy.
 
+<p align="center"><img src="assets/applet.png" alt="The Wayseam applet in the Omarchy bar: mode switch, VM controls, menu placement, and the Windows app list" width="360"></p>
+
+<p align="center"><em>The Wayseam applet in the Omarchy bar — Wayseam/Desktop mode, VM controls, menu placement, and every Windows app one click away.</em></p>
+
 > Status: **alpha, in daily use by the author**. It works well for the
 > conventional desktop apps it was built against (Affinity, Notepad, Windows
 > Terminal, Explorer, Office-style apps). Known gaps are listed below; they are
