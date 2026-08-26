@@ -41,7 +41,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:AgentVersion = '0.2.40-wayseam'
+$script:AgentVersion = '0.2.41-wayseam'
 $script:BlockedPointerButtons = @{}
 $script:StartedAt    = (Get-Date).ToUniversalTime().ToString('o')
 $script:OemDir       = 'C:\OEM'
@@ -926,6 +926,9 @@ public static class WayseamNativeCapture {
       var className = new System.Text.StringBuilder(256);
       GetWindowText(hwnd, title, title.Capacity);
       GetClassName(hwnd, className, className.Capacity);
+      // A CoreWindow at top level is the hosted half of a UWP app; its frame
+      // (ApplicationFrameWindow) is the window to present, never the core.
+      if (className.ToString() == "Windows.UI.Core.CoreWindow") return true;
       if (className.ToString() == "ApplicationFrameWindow") {
         uint hosted = HostedPid(hwnd);
         if (hosted != 0) pid = hosted;

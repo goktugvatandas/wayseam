@@ -176,6 +176,10 @@ public static class WayseamLaunchWindow {{
         return found;
     }}
     public static IntPtr FindVisible(uint wantedPid, bool explorerProcess) {{
+        // Packaged (UWP) apps: present the hosting frame, never the bare
+        // CoreWindow the process owns (capturing that one stalls WGC).
+        IntPtr hosted = FindHostedFrame(wantedPid);
+        if (hosted != IntPtr.Zero) return hosted;
         IntPtr found = IntPtr.Zero;
         long bestArea = 0;
         EnumWindows(delegate(IntPtr hwnd, IntPtr state) {{
@@ -184,7 +188,7 @@ public static class WayseamLaunchWindow {{
             GetWindowThreadProcessId(hwnd, out pid);
             if (pid != wantedPid || !IsWindowVisible(hwnd) || !GetWindowRect(hwnd, out rect) ||
                 rect.Right - rect.Left < 64 || rect.Bottom - rect.Top < 64 ||
-                !IsAppWindow(hwnd, explorerProcess)) {{
+                !IsAppWindow(hwnd, explorerProcess) || ClassName(hwnd) == "Windows.UI.Core.CoreWindow") {{
                 return true;
             }}
             long area = (long)(rect.Right - rect.Left) * (rect.Bottom - rect.Top);
@@ -194,7 +198,6 @@ public static class WayseamLaunchWindow {{
             }}
             return true;
         }}, IntPtr.Zero);
-        if (found == IntPtr.Zero) found = FindHostedFrame(wantedPid);
         return found;
     }}
 
