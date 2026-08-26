@@ -193,6 +193,7 @@ public static class WayseamWgcCapture
         public int MonitorTop;
         public int CropLeft;
         public int CropTop;
+        public DateTime LastTopmost;
 
         public void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
         {
@@ -470,6 +471,24 @@ public static class WayseamWgcCapture
         catch { }
     }
 
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+
+    private static void SetTopmost(IntPtr hwnd, bool topmost)
+    {
+        // Crop-mode windows are read off the display, so anything the guest
+        // stacks above them shows up in their tile — e.g. a window from
+        // another host workspace mirrored to the same tile position. Keep
+        // them above everything else while presented; per-window capture of
+        // the windows below is unaffected by z-order.
+        try
+        {
+            // SWP_NOMOVE|NOSIZE|NOACTIVATE
+            SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+        }
+        catch { }
+    }
+
     private static void SetMaximizeBox(IntPtr hwnd, bool enabled)
     {
         // With HTCAPTION clicks allowed through (caption strips hold real
@@ -512,6 +531,7 @@ public static class WayseamWgcCapture
                 SetBorderColor(hwnd, DWMWA_COLOR_NONE);
                 SetSystemBackdrop(hwnd, DWMSBT_NONE);
                 SetMaximizeBox(hwnd, false);
+                if (state.CropMode) SetTopmost(hwnd, true);
                 NudgeRepaint(hwnd);
             }
             state.LastSeen = DateTime.UtcNow;
@@ -554,6 +574,7 @@ public static class WayseamWgcCapture
             SetBorderColor(hwnd, DWMWA_COLOR_DEFAULT);
             SetSystemBackdrop(hwnd, DWMSBT_AUTO);
             SetMaximizeBox(hwnd, true);
+            if (expected.CropMode) SetTopmost(hwnd, false);
         }
     }
 
@@ -1257,6 +1278,11 @@ public static class WayseamWgcCapture
                 }
                 state.CropLeft = sourceX;
                 state.CropTop = sourceY;
+                if ((DateTime.UtcNow - state.LastTopmost).TotalSeconds > 2)
+                {
+                    state.LastTopmost = DateTime.UtcNow;
+                    SetTopmost(state.Hwnd, true);
+                }
             }
 
             bool full = state.Pixels == null || state.Width != width || state.Height != height;

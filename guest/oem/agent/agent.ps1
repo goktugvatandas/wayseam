@@ -41,7 +41,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:AgentVersion = '0.2.42-wayseam'
+$script:AgentVersion = '0.2.43-wayseam'
 $script:BlockedPointerButtons = @{}
 $script:StartedAt    = (Get-Date).ToUniversalTime().ToString('o')
 $script:OemDir       = 'C:\OEM'
