@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "goktugvatandas.wayseam",
   "name": "Windows",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Göktuğ Vatandaş",
   "license": "MIT",
   "description": "Wayseam: Windows apps as native Omarchy windows — mode switch, app visibility, menu placement.",
