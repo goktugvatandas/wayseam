@@ -30,6 +30,12 @@ CursorSurface {
   signal toggleRequested(var app)
   signal launchRequested(var app)
 
+  // The ⋯ menu is per row and closes when the cursor leaves the row or the
+  // app's visibility changes.
+  property bool menuOpen: false
+  onRowHasCursorChanged: if (!rowHasCursor) menuOpen = false
+  onHiddenChanged: menuOpen = false
+
   readonly property string slug: app ? String(app.slug || "") : ""
   readonly property string name: app ? String(app.name || slug) : ""
   readonly property real iconSize: Style.space(22)
@@ -46,7 +52,7 @@ CursorSurface {
   }
 
   hasCursor: rowHasCursor
-  implicitHeight: Math.max(labels.implicitHeight, toggle.implicitHeight) + Style.spacing.lg * 2
+  implicitHeight: Math.max(labels.implicitHeight, more.implicitHeight) + Style.spacing.lg * 2
 
   MouseArea {
     id: rowMouse
@@ -133,21 +139,36 @@ CursorSurface {
       color: Color.accent
     }
 
-    ToggleSwitch {
-      id: toggle
+    // Row actions live behind a ⋯ button: press it to reveal Hide/Show (with
+    // an eye icon) so the list stays quiet until you ask for the controls.
+    Button {
+      id: visibilityAction
+      visible: row.menuOpen
       Layout.alignment: Qt.AlignVCenter
-      checked: !row.hidden
-      busy: row.busy
+      iconText: row.hidden ? "󰈈" : "󰈉"
+      text: row.hidden ? "Show" : "Hide"
+      fontSize: Style.font.caption
+      foreground: row.foreground
+      fontFamily: row.fontFamily
+      bordered: true
+      enabled: !row.busy
+      tooltipText: row.hidden ? "Show in Omarchy menu" : "Hide from Omarchy menu"
+      onClicked: {
+        row.menuOpen = false
+        row.toggleRequested(row.app)
+      }
+    }
+
+    PanelActionButton {
+      id: more
+      Layout.alignment: Qt.AlignVCenter
+      iconText: "󰇘"
+      tooltipText: row.menuOpen ? "Close" : "More"
       hasCursor: row.rowHasCursor && row.cursorColumn === 0
       foreground: row.foreground
+      fontFamily: row.fontFamily
       onHovered: function(on) { if (on) row.columnHovered(row.rowIndex, 0) }
-      onToggled: row.toggleRequested(row.app)
-
-      PanelToolTip {
-        visible: toggle.containsMouse
-        text: row.hidden ? "Show in Omarchy menu" : "Hide from Omarchy menu"
-        fontFamily: row.fontFamily
-      }
+      onClicked: row.menuOpen = !row.menuOpen
     }
 
     PanelActionButton {
