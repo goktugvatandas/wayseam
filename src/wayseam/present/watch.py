@@ -51,9 +51,15 @@ def match_window_to_app(
     return None
 
 
+# Packaged (UWP) apps are hosted in ApplicationFrameHost frames whose content
+# per-window capture cannot see inside the VM (WGC yields the bare frame or
+# black). Until the display-crop capture path exists they are not presented.
+_UNPRESENTABLE_CLASSES = {"applicationframewindow"}
+
+
 def _is_shell_surface(window: WayseamTopLevel) -> bool:
     class_name = window.class_name.casefold()
-    if class_name in _SHELL_CLASSES:
+    if class_name in _SHELL_CLASSES or class_name in _UNPRESENTABLE_CLASSES:
         return True
     process_path = _windows_path(window.process_path)
     return (

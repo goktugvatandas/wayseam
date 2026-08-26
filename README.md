@@ -161,6 +161,9 @@ Omarchy integration details: `docs/OMARCHY.md`.
 ## Known gaps (alpha)
 
 - Guest drivers (parsec-vdd, IVSHMEM) are installed manually once.
+- Packaged (UWP) apps — Settings, Calculator, Store apps — are not presented
+  yet: per-window capture sees no content inside ApplicationFrameHost frames.
+  A display-crop capture path is planned; use Desktop Mode for them meanwhile.
 - WinUI apps with Mica/Acrylic backdrops capture without the backdrop (the
   in-window "Save changes?" prompt of the new Notepad shows only its buttons).
 - One host monitor at scale 1 is what is exercised; multi-monitor and

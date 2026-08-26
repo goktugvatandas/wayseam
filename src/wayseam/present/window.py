@@ -227,9 +227,17 @@ class LatestFramePump:
             if now - last_keepalive >= self.SHM_KEEPALIVE_SECONDS:
                 last_keepalive = now
                 try:
-                    self.client.shm_assign(self.hwnd)
+                    assigned = self.client.shm_assign(self.hwnd)
                     if self.error and "shm" in self.error:
                         self.error = None  # the agent is back; stop showing the hiccup
+                    # A restarted agent rebuilds its slot table: our HWND may
+                    # now publish into a different slot while this reader
+                    # still watches the old one (which another window may
+                    # have inherited — its frames would show up here).
+                    if getattr(assigned, "slot", None) is not None and assigned.slot != self.shm.slot:
+                        if not self._try_shm_upgrade():
+                            self.transport = "http"
+                            return
                 except AgentWindowGoneError:
                     self.window_gone.set()
                     return

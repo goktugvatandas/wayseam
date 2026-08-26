@@ -292,6 +292,10 @@ if ($null -eq $app) {{
     Write-Error "application did not expose a top-level window"
     exit 2
 }}
+if ([WayseamLaunchWindow]::ClassName($app.Handle) -eq "ApplicationFrameWindow") {{
+    Write-Error "packaged (UWP) apps cannot be presented yet: their windows are hosted by ApplicationFrameHost and per-window capture sees no content. Use Desktop Mode for this app for now."
+    exit 3
+}}
 [pscustomobject]@{{
     pid = [int]$app.Process.Id
     hwnd = [int64]$app.Handle
