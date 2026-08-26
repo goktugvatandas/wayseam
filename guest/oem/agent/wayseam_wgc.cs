@@ -187,6 +187,12 @@ public static class WayseamWgcCapture
         public int DirtyRight;
         public int DirtyBottom;
         public DateTime LastSeen;
+        // Crop mode (display capture cropped to the window; see WantsCropMode).
+        public bool CropMode;
+        public int MonitorLeft;
+        public int MonitorTop;
+        public int CropLeft;
+        public int CropTop;
 
         public void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
         {
@@ -261,6 +267,43 @@ public static class WayseamWgcCapture
             VtableMethod(instance, index), typeof(T)) as T;
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassNameW(IntPtr hwnd, System.Text.StringBuilder text, int count);
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO { public int Size; public Inp.RECT Monitor; public Inp.RECT Work; public uint Flags; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFO info);
+
+    private static string WindowClass(IntPtr hwnd)
+    {
+        var text = new System.Text.StringBuilder(256);
+        GetClassNameW(hwnd, text, text.Capacity);
+        return text.ToString();
+    }
+
+    // Packaged (UWP) apps render through ApplicationFrameHost; per-window
+    // capture of the frame yields only chrome and of the CoreWindow only
+    // black. DWM does compose them to the display, so those windows are
+    // captured from their monitor and cropped to the window rectangle. The
+    // guest mirrors the host tiling, so nothing else covers the window.
+    private static bool WantsCropMode(IntPtr hwnd)
+    {
+        return WindowClass(hwnd) == "ApplicationFrameWindow";
+    }
+
+    private static GraphicsCaptureItem CreateItemForMonitor(IntPtr monitor)
+    {
+        object factory = WindowsRuntimeMarshal.GetActivationFactory(typeof(GraphicsCaptureItem));
+        IGraphicsCaptureItemInterop interop = (IGraphicsCaptureItemInterop)factory;
+        Guid iid = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+        IntPtr pointer;
+        Check(interop.CreateForMonitor(monitor, ref iid, out pointer));
+        try { return (GraphicsCaptureItem)Marshal.GetObjectForIUnknown(pointer); }
+        finally { Marshal.Release(pointer); }
+    }
+
     private static GraphicsCaptureItem CreateItem(IntPtr hwnd)
     {
         object factory = WindowsRuntimeMarshal.GetActivationFactory(typeof(GraphicsCaptureItem));
@@ -318,7 +361,22 @@ public static class WayseamWgcCapture
         try
         {
             state.Hwnd = hwnd;
-            state.Item = CreateItem(hwnd);
+            if (WantsCropMode(hwnd))
+            {
+                IntPtr monitor = MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
+                MONITORINFO info = new MONITORINFO();
+                info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+                if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info))
+                    throw new InvalidOperationException("monitor for crop capture not found");
+                state.CropMode = true;
+                state.MonitorLeft = info.Monitor.Left;
+                state.MonitorTop = info.Monitor.Top;
+                state.Item = CreateItemForMonitor(monitor);
+            }
+            else
+            {
+                state.Item = CreateItem(hwnd);
+            }
             state.Device = CreateDevice();
             state.PoolWidth = state.Item.Size.Width;
             state.PoolHeight = state.Item.Size.Height;
@@ -535,7 +593,9 @@ public static class WayseamWgcCapture
         int top,
         int right,
         int bottom,
-        bool full)
+        bool full,
+        int sourceX,
+        int sourceY)
     {
         IDirect3DDxgiInterfaceAccess access = (IDirect3DDxgiInterfaceAccess)surface;
         Guid textureIid = new Guid("6F15AAF2-D208-4E89-9AB4-489535D34F9C");
@@ -545,19 +605,22 @@ public static class WayseamWgcCapture
         {
             Check(access.GetInterface(ref textureIid, out source));
             EnsureStaging(state, source);
-            if (full)
+            if (full && sourceX == 0 && sourceY == 0 && !state.CropMode)
             {
                 Method<CopyResourceDelegate>(state.Device.NativeContext, 47)(
                     state.Device.NativeContext, state.Staging, source);
             }
             else
             {
+                // Window-space rectangle [left,right)x[top,bottom) lives at
+                // (sourceX, sourceY) inside the source texture (the monitor in
+                // crop mode); copy it to the same place in the staging copy.
                 D3D11Box box = new D3D11Box();
-                box.Left = (uint)Math.Min((uint)left, state.StagingWidth);
-                box.Top = (uint)Math.Min((uint)top, state.StagingHeight);
+                box.Left = (uint)Math.Min((uint)(sourceX + left), state.StagingWidth);
+                box.Top = (uint)Math.Min((uint)(sourceY + top), state.StagingHeight);
                 box.Front = 0;
-                box.Right = (uint)Math.Min((uint)right, state.StagingWidth);
-                box.Bottom = (uint)Math.Min((uint)bottom, state.StagingHeight);
+                box.Right = (uint)Math.Min((uint)(sourceX + right), state.StagingWidth);
+                box.Bottom = (uint)Math.Min((uint)(sourceY + bottom), state.StagingHeight);
                 if (box.Right <= box.Left || box.Bottom <= box.Top)
                 {
                     return;
@@ -567,8 +630,8 @@ public static class WayseamWgcCapture
                     state.Device.NativeContext,
                     state.Staging,
                     0,
-                    (uint)left,
-                    (uint)top,
+                    box.Left,
+                    box.Top,
                     0,
                     source,
                     0,
@@ -596,11 +659,14 @@ public static class WayseamWgcCapture
             // the allocation and killed the whole agent with an access
             // violation. Copy only the intersection; the next frame after the
             // pool recreate repaints whatever was left stale.
-            int mappedWidth = (int)Math.Min(state.StagingWidth, (uint)width);
-            int mappedHeight = (int)Math.Min(state.StagingHeight, (uint)height);
-            if (data.RowPitch < (uint)mappedWidth * 4u)
+            int availableWidth = (int)state.StagingWidth - sourceX;
+            int availableHeight = (int)state.StagingHeight - sourceY;
+            if (availableWidth <= 0 || availableHeight <= 0) return;
+            int mappedWidth = Math.Min(availableWidth, width);
+            int mappedHeight = Math.Min(availableHeight, height);
+            if (data.RowPitch < (uint)(sourceX + mappedWidth) * 4u)
             {
-                mappedWidth = (int)(data.RowPitch / 4u);
+                mappedWidth = (int)(data.RowPitch / 4u) - sourceX;
             }
             right = Math.Min(right, mappedWidth);
             bottom = Math.Min(bottom, mappedHeight);
@@ -609,7 +675,7 @@ public static class WayseamWgcCapture
             for (int y = top; y < bottom; y++)
             {
                 Marshal.Copy(
-                    IntPtr.Add(data.Data, checked((int)data.RowPitch * y + left * 4)),
+                    IntPtr.Add(data.Data, checked((int)data.RowPitch * (sourceY + y) + (sourceX + left) * 4)),
                     state.Pixels,
                     y * stride + left * 4,
                     rowBytes);
@@ -1142,15 +1208,15 @@ public static class WayseamWgcCapture
         while (frame != null && processed < 4)
         {
             processed++;
-            int width = frame.ContentSize.Width;
-            int height = frame.ContentSize.Height;
-            if (width <= 0 || height <= 0 || width > 8192 || height > 8192 ||
-                (long)width * (long)height > 33554432L)
+            int sourceWidth = frame.ContentSize.Width;
+            int sourceHeight = frame.ContentSize.Height;
+            if (sourceWidth <= 0 || sourceHeight <= 0 || sourceWidth > 8192 || sourceHeight > 8192 ||
+                (long)sourceWidth * (long)sourceHeight > 33554432L)
             {
                 frame.Dispose();
                 throw new InvalidOperationException("capture dimensions rejected");
             }
-            if (width != state.PoolWidth || height != state.PoolHeight)
+            if (sourceWidth != state.PoolWidth || sourceHeight != state.PoolHeight)
             {
                 SizeInt32 newSize = frame.ContentSize;
                 frame.Dispose();
@@ -1159,14 +1225,38 @@ public static class WayseamWgcCapture
                     DirectXPixelFormat.B8G8R8A8UIntNormalized,
                     2,
                     newSize);
-                state.PoolWidth = width;
-                state.PoolHeight = height;
+                state.PoolWidth = sourceWidth;
+                state.PoolHeight = sourceHeight;
                 state.Pixels = null;
-                state.Width = width;
-                state.Height = height;
+                if (!state.CropMode) { state.Width = sourceWidth; state.Height = sourceHeight; }
                 state.FrameReady.WaitOne(1000);
                 frame = state.Pool.TryGetNextFrame();
                 continue;
+            }
+
+            // Window-space geometry: the whole frame for a window item, the
+            // window's visible rectangle inside the monitor for crop mode.
+            int width = sourceWidth, height = sourceHeight, sourceX = 0, sourceY = 0;
+            if (state.CropMode)
+            {
+                Inp.RECT rect;
+                if (!Inp.IsWindow(state.Hwnd) || !Inp.GetVisibleRect(state.Hwnd, out rect))
+                {
+                    frame.Dispose();
+                    throw new InvalidOperationException("window for crop capture is gone");
+                }
+                sourceX = Math.Max(0, rect.Left - state.MonitorLeft);
+                sourceY = Math.Max(0, rect.Top - state.MonitorTop);
+                width = Math.Min(rect.Right - rect.Left, sourceWidth - sourceX);
+                height = Math.Min(rect.Bottom - rect.Top, sourceHeight - sourceY);
+                if (width <= 0 || height <= 0)
+                {
+                    frame.Dispose();
+                    frame = state.Pool.TryGetNextFrame();
+                    continue;
+                }
+                state.CropLeft = sourceX;
+                state.CropTop = sourceY;
             }
 
             bool full = state.Pixels == null || state.Width != width || state.Height != height;
@@ -1178,10 +1268,12 @@ public static class WayseamWgcCapture
             {
                 foreach (RectInt32 region in frame.DirtyRegions)
                 {
-                    int regionLeft = Math.Max(0, region.X);
-                    int regionTop = Math.Max(0, region.Y);
-                    int regionRight = Math.Min(width, region.X + region.Width);
-                    int regionBottom = Math.Min(height, region.Y + region.Height);
+                    // Dirty rectangles arrive in source (monitor) space; move
+                    // them into window space and clip to the window.
+                    int regionLeft = Math.Max(0, region.X - sourceX);
+                    int regionTop = Math.Max(0, region.Y - sourceY);
+                    int regionRight = Math.Min(width, region.X + region.Width - sourceX);
+                    int regionBottom = Math.Min(height, region.Y + region.Height - sourceY);
                     if (regionRight <= regionLeft || regionBottom <= regionTop) continue;
                     if (regionLeft < left) left = regionLeft;
                     if (regionTop < top) top = regionTop;
@@ -1193,7 +1285,7 @@ public static class WayseamWgcCapture
             {
                 UpdatePixels(
                     state, frame.Surface, width, height,
-                    left, top, right, bottom, full);
+                    left, top, right, bottom, full, sourceX, sourceY);
                 if (left < dirtyLeft) dirtyLeft = left;
                 if (top < dirtyTop) dirtyTop = top;
                 if (right > dirtyRight) dirtyRight = right;

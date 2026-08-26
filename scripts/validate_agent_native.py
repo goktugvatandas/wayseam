@@ -11,8 +11,8 @@ from wayseam.guest.agent import AgentClient
 
 def main() -> int:
     source = (
-        Path(__file__).resolve().parents[2]
-        / "config"
+        Path(__file__).resolve().parents[1]
+        / "guest"
         / "oem"
         / "agent"
         / "agent.ps1"

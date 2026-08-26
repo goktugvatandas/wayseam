@@ -35,8 +35,8 @@ def main() -> int:
     if len(windows) != 1:
         raise SystemExit(f"expected one process root, found {len(windows)}")
     source = (
-        Path(__file__).resolve().parents[2]
-        / "config"
+        Path(__file__).resolve().parents[1]
+        / "guest"
         / "oem"
         / "agent"
         / "wayseam_wgc.cs"

@@ -719,12 +719,12 @@ def test_wayseam_wgc_readback_never_exceeds_the_mapped_staging_surface():
     # after a resize). The readback must be clamped to the staging texture.
     source = WGC_CS.read_text(encoding="utf-8")
     for marker in (
-        "int mappedWidth = (int)Math.Min(state.StagingWidth, (uint)width);",
-        "int mappedHeight = (int)Math.Min(state.StagingHeight, (uint)height);",
-        "if (data.RowPitch < (uint)mappedWidth * 4u)",
+        "int mappedWidth = Math.Min(availableWidth, width);",
+        "int mappedHeight = Math.Min(availableHeight, height);",
+        "if (data.RowPitch < (uint)(sourceX + mappedWidth) * 4u)",
         "right = Math.Min(right, mappedWidth);",
         "bottom = Math.Min(bottom, mappedHeight);",
-        "box.Right = (uint)Math.Min((uint)right, state.StagingWidth);",
+        "box.Right = (uint)Math.Min((uint)(sourceX + right), state.StagingWidth);",
     ):
         assert marker in source
 
