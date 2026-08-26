@@ -130,7 +130,23 @@ public static class WayseamLaunchWindow {{
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     private static extern int GetWindowTextLength(IntPtr hwnd);
 
-    public static IntPtr FindVisible(uint wantedPid) {{
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hwnd, StringBuilder text, int count);
+    public static string ClassName(IntPtr hwnd) {{
+        StringBuilder text = new StringBuilder(256);
+        GetClassName(hwnd, text, text.Capacity);
+        return text.ToString();
+    }}
+    // Shell surfaces (desktop, taskbar) are never "the app's window". For
+    // explorer.exe — always running as the shell — only folder windows count,
+    // otherwise launching File Explorer "reuses" the desktop itself.
+    public static bool IsAppWindow(IntPtr hwnd, bool explorerProcess) {{
+        string cls = ClassName(hwnd).ToLowerInvariant();
+        if (cls == "progman" || cls == "workerw" || cls == "shell_traywnd" || cls == "shell_secondarytraywnd") return false;
+        if (explorerProcess) return cls == "cabinetwclass" || cls == "explorewclass";
+        return true;
+    }}
+    public static IntPtr FindVisible(uint wantedPid, bool explorerProcess) {{
         IntPtr found = IntPtr.Zero;
         long bestArea = 0;
         EnumWindows(delegate(IntPtr hwnd, IntPtr state) {{
@@ -138,7 +154,8 @@ public static class WayseamLaunchWindow {{
             RECT rect;
             GetWindowThreadProcessId(hwnd, out pid);
             if (pid != wantedPid || !IsWindowVisible(hwnd) || !GetWindowRect(hwnd, out rect) ||
-                rect.Right - rect.Left < 64 || rect.Bottom - rect.Top < 64) {{
+                rect.Right - rect.Left < 64 || rect.Bottom - rect.Top < 64 ||
+                !IsAppWindow(hwnd, explorerProcess)) {{
                 return true;
             }}
             long area = (long)(rect.Right - rect.Left) * (rect.Bottom - rect.Top);
@@ -191,7 +208,8 @@ function Find-WayseamAppWindow {{
     }})) {{
         try {{
             if ($candidate.Path -ieq $exe) {{
-                $handle = [WayseamLaunchWindow]::FindVisible([uint32]$candidate.Id)
+                $isExplorer = [bool]($candidate.Path -like '*\explorer.exe')
+                $handle = [WayseamLaunchWindow]::FindVisible([uint32]$candidate.Id, $isExplorer)
                 if ($handle -ne [IntPtr]::Zero) {{
                     return [pscustomobject]@{{
                         Process = $candidate
